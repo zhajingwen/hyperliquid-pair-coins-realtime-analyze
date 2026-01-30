@@ -1,6 +1,6 @@
 # hyperliquid-pair-hype-purr-analyze 技术设计文档
 
-**版本**: v1.0
+**版本**: v1.1
 **生成日期**: 2026-01-31
 **作者**: Claude Code
 **项目**: 加密货币配对交易信号实时分析系统
@@ -35,7 +35,7 @@
 - 实时信号发现引擎
 - 统计套利机会监控平台
 
-**代码引用**: `realtime_kline_service.py:1-35`
+**代码引用**: `src/services/realtime_kline_service.py:1-35`
 
 ### 1.2 核心功能
 
@@ -45,7 +45,7 @@
 - **精度保证**: 数据精度与REST API完全一致，无本地聚合误差
 - **订阅优势**: 1h/4h推送频率极低 (<2%额外开销)，Volume数据完全一致
 
-**代码引用**: `realtime_kline_service.py:5-26`
+**代码引用**: `src/services/realtime_kline_service.py:5-26`
 
 #### 多周期统计分析
 - **相关性分析**: 基于收益率相关系数 (去趋势化、平稳性)
@@ -59,7 +59,7 @@
 - 1h周期: 30天历史数据
 - 4h周期: 60天历史数据
 
-**代码引用**: `utils/analysis_core.py:1-44`
+**代码引用**: `src/utils/analysis/analysis_core.py:1-44`
 
 #### 智能告警系统
 - **飞书富文本告警**: 彩色卡片格式化
@@ -70,7 +70,7 @@
   - 协整健康状态约束 (短期窗口需HEALTHY)
 - **重试机制**: 最大3次，指数退避
 
-**代码引用**: `utils/alert_formatter.py`
+**代码引用**: `src/utils/monitoring/alert_formatter.py`
 
 #### 数据质量保证
 - **K线连续性校验**: 检测时间间隙
@@ -78,7 +78,7 @@
 - **黑名单机制**: 过滤数据不足的新币种
 - **协整健康监控**: 避免协整关系恶化时的虚假信号
 
-**代码引用**: `utils/kline_data_filler.py`
+**代码引用**: `src/utils/analysis/kline_data_filler.py`
 
 ### 1.3 技术栈
 
@@ -122,7 +122,7 @@
 
 **设计权衡**: 放弃本地聚合换取数据精度和简洁性
 
-**代码引用**: `realtime_kline_service.py:22-26`
+**代码引用**: `src/services/realtime_kline_service.py:22-26`
 
 #### 2. 双窗口OLS协整分析
 - **beta_window=100期**: 稳定回归参数
@@ -132,7 +132,7 @@
 
 **设计优势**: 平衡稳定性与灵敏度
 
-**代码引用**: `utils/analysis_core.py:185-407`, `utils/config.py:BETA_WINDOW`, `utils/config.py:ZSCORE_WINDOW`
+**代码引用**: `src/utils/analysis/analysis_core.py:185-407`, `src/utils/core/config.py:BETA_WINDOW`, `src/utils/core/config.py:ZSCORE_WINDOW`
 
 #### 3. 多线程异步批量写入
 - **COPY命令**: >40K条/秒 (比INSERT快100倍)
@@ -142,7 +142,7 @@
 
 **性能提升**: 批量写入性能提升100倍
 
-**代码引用**: `timescaledb.py:342-450`, `realtime_kline_service.py:635-760`
+**代码引用**: `src/utils/database/timescaledb.py:342-450`, `src/services/realtime_kline_service.py:635-760`
 
 #### 4. 双重健康检测
 **底层连接检测**:
@@ -167,6 +167,16 @@
 
 **代码引用**: `enhanced_ws_manager.py:120-183`, `enhanced_ws_manager.py:698-781`
 
+#### 6. Template Method Pattern 架构
+- **90%共同逻辑**: 1599行基类封装核心流程
+- **4个抽象方法**: 子类定制差异化行为（币种获取、基准设置、监控开关、数据填充器）
+- **2个实现版本**: 通用版（动态币种，15 workers，22线程）+ HYPE版（固定币种，2 workers，8线程）
+- **配置参数化**: ServiceConfig 数据类传递配置差异
+
+**设计优势**: 消除代码重复，提升可维护性，支持多场景部署
+
+**代码引用**: `src/services/realtime_kline_service_base.py:1-1599`
+
 ---
 
 ## 2. 系统架构设计
@@ -185,7 +195,7 @@ graph TD
     E -->|批量1000条/5秒| G[batch_writer线程]
     G -->|COPY命令| H[(TimescaleDB<br/>klines表)]
 
-    F -->|并发消费| I[15×analysis_worker线程]
+    F -->|并发消费| I[N×analysis_worker线程<br/>通用版:15 / HYPE版:2]
     I -->|多周期验证| J[analysis_result_buffer<br/>Queue 10000]
     I -->|Z-score异常| K[飞书告警<br/>Lark Bot API]
 
@@ -201,7 +211,7 @@ graph TD
     O[new_symbol_monitor线程] -.每小时检查.-> B
 ```
 
-**代码引用**: `realtime_kline_service.py:118-141`
+**代码引用**: `src/services/realtime_kline_service.py:118-141`
 
 ### 2.2 核心组件关系
 
@@ -218,7 +228,7 @@ graph TD
 
 **总线程数**: 22个线程 (3+1+15+1+1+1)
 
-**代码引用**: `realtime_kline_service.py:224-275`
+**代码引用**: `src/services/realtime_kline_service.py:224-275`
 
 #### 组件交互流程
 
@@ -248,7 +258,7 @@ graph TD
    异常检测成功 → 飞书告警 (重试3次) → 记录发送结果
    ```
 
-**代码引用**: `realtime_kline_service.py:635-1035`
+**代码引用**: `src/services/realtime_kline_service.py:635-1035`
 
 ### 2.3 数据流设计
 
@@ -278,7 +288,7 @@ sequenceDiagram
 - **入队去重**: 30秒窗口 (TTLCache)
 - **数据库去重**: 主键 `(time, symbol, timeframe)` ON CONFLICT UPDATE
 
-**代码引用**: `realtime_kline_service.py:635-760`, `timescaledb.py:342-450`
+**代码引用**: `src/services/realtime_kline_service.py:635-760`, `src/utils/database/timescaledb.py:342-450`
 
 #### 分析数据流
 
@@ -317,7 +327,7 @@ sequenceDiagram
 - 4h周期: 900秒窗口
 - 跨线程共享: 所有analysis_worker共享同一TTLCache
 
-**代码引用**: `realtime_kline_service.py:908-1035`, `realtime_kline_service.py:1037-1402`
+**代码引用**: `src/services/realtime_kline_service.py:908-1035`, `src/services/realtime_kline_service.py:1037-1402`
 
 ### 2.4 技术选型说明
 
@@ -363,7 +373,152 @@ sequenceDiagram
 - ❌ 线程上下文切换开销 (但15线程规模可接受)
 - ✅ 避免asyncio生态碎片化问题
 
-**代码引用**: `realtime_kline_service.py:224-275`
+**代码引用**: `src/services/realtime_kline_service.py:224-275`
+
+### 2.5 架构模式设计
+
+#### Template Method Pattern 应用
+
+**设计背景**:
+- **代码重复问题**: 通用版和HYPE版服务存在90%相同逻辑（1440+行）
+- **维护成本**: 双份代码同步维护，bug修复需要两处更改
+- **扩展需求**: 未来可能支持更多配对策略（如三角套利、跨交易所）
+
+**解决方案**: 引入 Template Method Pattern，将共同逻辑抽取到抽象基类
+
+**架构组成**:
+1. **ServiceConfig 数据类**: 参数化配置差异
+2. **RealtimeKlineServiceBase 抽象基类**: 封装1599行核心流程
+3. **RealtimeKlineService 通用版**: 182行实现，动态币种获取
+4. **RealtimeKlineServiceHype HYPE版**: 146行实现，固定币种配对
+
+#### ServiceConfig 配置类
+
+**数据结构** (`src/services/realtime_kline_service_base.py:80-89`):
+```python
+@dataclass
+class ServiceConfig:
+    """服务配置数据类"""
+    base_symbol: str                    # 基准币种 (如 "BTC/USDC:USDC" 或 "HYPE/USDC:USDC")
+    correlation_threshold: float        # 相关系数阈值 (0.85 或 0.99)
+    analysis_workers: int               # 分析线程数 (15 或 2)
+    queue_config: dict                  # 队列大小配置
+    enable_new_symbol_monitor: bool     # 是否启用新币种监控
+    data_filler_class: Type             # 数据填充器类型
+```
+
+**配置对比**:
+
+| 配置字段 | 通用版 | HYPE版 | 差异原因 |
+|---------|--------|--------|---------|
+| base_symbol | BTC/USDC:USDC | HYPE/USDC:USDC | HYPE版专注单一配对 |
+| correlation_threshold | 0.85 | 0.99 | HYPE版要求更高相关性 |
+| analysis_workers | 15 | 2 | HYPE版订阅数少，减少线程 |
+| kline_buffer | 10000 | 5000 | HYPE版订阅数少 |
+| analysis_queue | 15000 | 3000 | 分析任务少 |
+| enable_new_symbol_monitor | ✅ True | ❌ False | HYPE版固定币种列表 |
+| data_filler_class | KlineDataFiller | KlineDataFillerLazy | HYPE版使用懒加载 |
+
+#### RealtimeKlineServiceBase 抽象基类
+
+**核心职责** (`src/services/realtime_kline_service_base.py:92-1599`):
+- ✅ WebSocket连接管理（ping/健康监控/断线重连）
+- ✅ K线数据接收和批量写入
+- ✅ 分析任务队列管理（15个worker线程）
+- ✅ 结果写入和告警发送
+- ✅ 队列监控和性能统计
+
+**4个抽象方法** (子类必须实现):
+
+```python
+@abstractmethod
+def get_symbols(self) -> List[str]:
+    """获取需要订阅的币种列表"""
+    pass
+
+@abstractmethod
+def get_base_symbol(self) -> str:
+    """获取基准币种"""
+    pass
+
+@abstractmethod
+def should_monitor_new_symbols(self) -> bool:
+    """是否启用新币种监控"""
+    pass
+
+@abstractmethod
+def create_data_filler(self) -> KlineDataFiller:
+    """创建数据填充器实例"""
+    pass
+```
+
+#### 两个实现版本对比
+
+| 维度 | 通用版 | HYPE版 |
+|------|--------|--------|
+| **文件** | `src/services/realtime_kline_service.py` | `src/services/realtime_kline_service_hype.py` |
+| **文件大小** | 182行 | 146行 |
+| **币种来源** | 动态获取（TimescaleDB查询） | 固定列表 `["PURR/USDC:USDC"]` |
+| **基准币种** | BTC/USDC:USDC | HYPE/USDC:USDC |
+| **相关系数阈值** | 0.85 | 0.99 |
+| **分析线程数** | 15 | 2 |
+| **队列大小** | kline:10000, analysis:15000 | kline:5000, analysis:3000 |
+| **币种监控** | ✅ 启用（每5分钟检测新币种） | ❌ 禁用 |
+| **数据填充器** | KlineDataFiller | KlineDataFillerLazy |
+| **总线程数** | 22 | 8 |
+
+**通用版实现** (`src/services/realtime_kline_service.py:89-103`):
+```python
+def get_symbols(self) -> List[str]:
+    """动态获取币种列表（从TimescaleDB）"""
+    with self.pool.connection() as conn:
+        # 查询最近24小时有交易的币种
+        symbols = conn.execute(
+            "SELECT DISTINCT symbol FROM klines WHERE time > NOW() - INTERVAL '24 hours'"
+        ).fetchall()
+    return [s[0] for s in symbols]
+
+def should_monitor_new_symbols(self) -> bool:
+    return True  # 启用新币种监控
+```
+
+**HYPE版实现** (`src/services/realtime_kline_service_hype.py:87-101`):
+```python
+def get_symbols(self) -> List[str]:
+    """返回固定币种列表"""
+    return ["PURR/USDC:USDC"]
+
+def should_monitor_new_symbols(self) -> bool:
+    return False  # 禁用新币种监控
+```
+
+#### 架构优势
+
+**代码复用率**:
+- ✅ 共享代码: 1599行（90%）
+- ✅ 通用版独有: 182行（10%）
+- ✅ HYPE版独有: 146行（8%）
+- ✅ 消除重复: 避免1440+行重复代码
+
+**维护效率**:
+- ✅ 单点修改: bug修复只需改基类
+- ✅ 统一升级: 性能优化自动惠及所有版本
+- ✅ 一致性保证: 核心逻辑完全一致
+
+**扩展性**:
+- ✅ 新增策略: 只需实现4个抽象方法（<200行）
+- ✅ 配置化差异: ServiceConfig 数据类清晰表达差异
+- ✅ 多态支持: 基类引用，子类实例化
+
+**测试友好**:
+- ✅ 隔离测试: 基类逻辑独立测试
+- ✅ Mock简单: 抽象方法易于Mock
+- ✅ 覆盖率高: 1599行基类测试覆盖90%代码
+
+**代码引用**:
+- 基类: `src/services/realtime_kline_service_base.py:80-1599`
+- 通用版: `src/services/realtime_kline_service.py:1-182`
+- HYPE版: `src/services/realtime_kline_service_hype.py:1-146`
 
 ---
 
@@ -648,7 +803,7 @@ class TimescaleDBClient:
 - 避免重复初始化
 - 线程安全
 
-**代码引用**: `timescaledb.py:94-129`
+**代码引用**: `src/utils/database/timescaledb.py:94-129`
 
 #### 连接池配置
 
@@ -670,7 +825,7 @@ self._pool = ConnectionPool(
 - `max_lifetime=3600`: 每小时回收连接（防止连接泄漏）
 - `max_idle=600`: 10分钟空闲自动回收
 
-**代码引用**: `timescaledb.py:131-150`
+**代码引用**: `src/utils/database/timescaledb.py:131-150`
 
 #### 连接污染检测
 
@@ -710,7 +865,7 @@ def get_connection(self) -> Connection:
 3. 污染连接关闭并移除
 4. 健康连接返回连接池复用
 
-**代码引用**: `timescaledb.py:152-217`
+**代码引用**: `src/utils/database/timescaledb.py:152-217`
 
 ---
 
@@ -1053,7 +1208,7 @@ flowchart TD
     P --> Q[分析完成]
 ```
 
-**代码引用**: `realtime_kline_service.py:1037-1402`
+**代码引用**: `src/services/realtime_kline_service.py:1037-1402`
 
 ### 5.2 相关性分析
 
@@ -1088,7 +1243,7 @@ if abs(correlation) < TARGET_CORR_THRESHOLD:
     return None
 ```
 
-**代码引用**: `utils/analysis_core.py:83-141`
+**代码引用**: `src/utils/analysis/analysis_core.py:83-141`
 
 ### 5.3 协整检验 (Engle-Granger)
 
@@ -1146,7 +1301,7 @@ def calculate_cointegration_params_ols(
 - 回测验证
 - 历史分析
 
-**代码引用**: `utils/analysis_core.py:185-277`
+**代码引用**: `src/utils/analysis/analysis_core.py:185-277`
 
 #### New方法 - 双窗口OLS
 
@@ -1222,7 +1377,7 @@ BETA_WINDOW = 100  # 约20天（5m周期）
 ZSCORE_WINDOW = 30  # 约6天（5m周期）
 ```
 
-**代码引用**: `utils/analysis_core.py:280-407`, `utils/config.py:BETA_WINDOW`, `utils/config.py:ZSCORE_WINDOW`
+**代码引用**: `src/utils/analysis/analysis_core.py:280-407`, `src/utils/core/config.py:BETA_WINDOW`, `src/utils/core/config.py:ZSCORE_WINDOW`
 
 #### 智能模型选择
 
@@ -1251,7 +1406,7 @@ def _select_cointegration_model(alpha: float, alpha_pvalue: float) -> Tuple[str,
 - **同类资产配对** (如UNI/SUSHI): α显著且小 → 使用标准EG模型
 - **不确定情况**: 默认无α模型（更稳健）
 
-**代码引用**: `utils/analysis_core.py:149-183`
+**代码引用**: `src/utils/analysis/analysis_core.py:149-183`
 
 ### 5.4 Z-score计算与异常检测
 
@@ -1271,7 +1426,7 @@ current_zscore = (current_spread - spread_mean) / spread_std
 - 不使用当前值计算均值/标准差
 - 避免Z-score被当前异常值拉扯
 
-**代码引用**: `utils/analysis_core.py:410-481`
+**代码引用**: `src/utils/analysis/analysis_core.py:410-481`
 
 #### 异常检测阈值
 
@@ -1297,7 +1452,7 @@ if abs(zscore) > threshold:
         direction = "long"   # 目标币低估，做多配对
 ```
 
-**代码引用**: `utils/config.py:ZSCORE_THRESHOLDS`
+**代码引用**: `src/utils/core/config.py:ZSCORE_THRESHOLDS`
 
 ### 5.5 多周期验证机制
 
@@ -1389,7 +1544,7 @@ def analyze_multi_period(
 3. Z-score符号必须一致
 4. 至少1个周期Z-score超阈值
 
-**代码引用**: `utils/analysis_core.py:737-996`, `realtime_kline_service.py:1037-1402`
+**代码引用**: `src/utils/analysis/analysis_core.py:737-996`, `src/services/realtime_kline_service.py:1037-1402`
 
 ### 5.6 协整健康监控
 
@@ -1481,7 +1636,7 @@ if health_result['short_window_state'] != "HEALTHY":
 - 双窗口监控: 长期趋势 + 短期状态
 - 短期状态优先: 告警约束
 
-**代码引用**: `utils/coingetation_more_check.py`
+**代码引用**: `src/utils/analysis/coingetation_more_check.py`
 
 ---
 
@@ -1490,6 +1645,8 @@ if health_result['short_window_state'] != "HEALTHY":
 ### 6.1 线程模型
 
 #### 线程清单
+
+**通用版线程配置** (22个线程):
 
 | 线程名称 | 数量 | 职责 | 启动方式 |
 |---------|------|------|---------|
@@ -1502,9 +1659,24 @@ if health_result['short_window_state'] != "HEALTHY":
 | queue_monitor线程 | 1 | 队列使用率监控 | `threading.Thread` |
 | new_symbol_monitor线程 | 1 | 新币种监控 | `threading.Thread` |
 
-**总线程数**: 22个线程
+**HYPE版线程配置** (8个线程):
 
-**代码引用**: `realtime_kline_service.py:224-275`, `enhanced_ws_manager.py:501-597`
+| 线程名称 | 数量 | 差异说明 |
+|---------|------|---------|
+| WebSocket相关 | 3 | 主线程 + Ping线程 + 健康监控线程（相同） |
+| batch_writer | 1 | K线批量写入（相同） |
+| analysis_worker | 2 | ⚠️ 减少至2个（订阅数少） |
+| result_batch_writer | 1 | 分析结果批量写入（相同） |
+| queue_monitor | 1 | 队列使用率监控（相同） |
+| new_symbol_monitor | 0 | ❌ 禁用（固定币种列表） |
+
+**线程数对比**:
+- 通用版: 22个线程 (3 WebSocket + 1 批量写入 + 15 分析worker + 1 结果写入 + 1 队列监控 + 1 币种监控)
+- HYPE版: 8个线程 (3 WebSocket + 1 批量写入 + 2 分析worker + 1 结果写入 + 1 队列监控)
+
+**差异原因**: HYPE版专注单一配对（HYPE/PURR），订阅数少，减少worker数量，取消币种监控
+
+**代码引用**: `src/services/realtime_kline_service.py:224-275`, `enhanced_ws_manager.py:501-597`
 
 #### 线程生命周期管理
 
@@ -1587,7 +1759,7 @@ def stop_service(self):
 - 主线程退出时自动终止所有daemon线程
 - 超时保护: join(timeout=30s)
 
-**代码引用**: `realtime_kline_service.py:224-275`, `realtime_kline_service.py:1589-1659`
+**代码引用**: `src/services/realtime_kline_service.py:224-275`, `src/services/realtime_kline_service.py:1589-1659`
 
 ### 6.2 队列设计
 
@@ -1599,7 +1771,7 @@ def stop_service(self):
 | analysis_queue | 15000 | queue.Queue | on_message (5m) | 15×analysis_worker | 实时消费 |
 | analysis_result_buffer | 10000 | queue.Queue | 15×analysis_worker | result_batch_writer | 100条 OR 2秒 |
 
-**代码引用**: `realtime_kline_service.py:208-220`
+**代码引用**: `src/services/realtime_kline_service.py:208-220`
 
 #### 队列配置
 
@@ -1622,7 +1794,24 @@ self.analysis_result_buffer = queue.Queue(maxsize=QUEUE_CONFIG_GENERAL['analysis
 - analysis_queue: 15000条 ≈ 15分钟缓冲（考虑分析耗时）
 - analysis_result_buffer: 10000条 ≈ 批量写入缓冲
 
-**代码引用**: `utils/config.py:QUEUE_CONFIG_GENERAL`, `realtime_kline_service.py:208-220`
+**代码引用**: `src/utils/core/config.py:QUEUE_CONFIG_GENERAL`, `src/services/realtime_kline_service.py:208-220`
+
+#### 队列配置对比（通用版 vs HYPE版）
+
+| 队列 | 通用版 | HYPE版 | 差异原因 |
+|------|-------|--------|---------|
+| kline_buffer | 10000 | 5000 | HYPE版订阅数少（1个币种 vs N个币种） |
+| analysis_queue | 15000 | 3000 | 分析worker少（2个 vs 15个） |
+| analysis_result_buffer | 10000 | 5000 | 结果产生速度低（2 workers） |
+
+**配置来源**: `src/utils/core/config.py`
+- 通用版: `QUEUE_CONFIG_GENERAL`
+- HYPE版: `QUEUE_CONFIG_HYPE`
+
+**设计原则**:
+- HYPE版订阅数: 1个币种 × 3周期 = 3个订阅（vs 通用版N×3）
+- 队列大小按比例缩减（约50%），避免资源浪费
+- 保持相同的批量触发条件（1000条/5秒，100条/2秒）
 
 ### 6.3 去重机制
 
@@ -1645,7 +1834,7 @@ self.recent_analysis_lock = threading.Lock()
 - 最大容量: 10000条
 - 防止内存泄漏: 自动清理过期记录
 
-**代码引用**: `realtime_kline_service.py:193-205`
+**代码引用**: `src/services/realtime_kline_service.py:193-205`
 
 #### 入队去重窗口
 
@@ -1685,7 +1874,7 @@ def _enqueue_analysis_if_needed(self, symbol: str, timeframe: str, kline_time: d
 - 1h周期: 180秒 (约1/20周期)
 - 4h周期: 600秒 (约1/24周期)
 
-**代码引用**: `utils/config.py:ENQUEUE_DEDUP_WINDOWS`, `realtime_kline_service.py:575-633`
+**代码引用**: `src/utils/core/config.py:ENQUEUE_DEDUP_WINDOWS`, `src/services/realtime_kline_service.py:575-633`
 
 #### 分析去重窗口
 
@@ -1725,7 +1914,7 @@ def _analyze_and_alert(self, task: Dict):
 - 所有analysis_worker共享同一`recent_analysis`字典
 - 使用`recent_analysis_lock`保证线程安全
 
-**代码引用**: `utils/config.py:DEDUP_WINDOWS`, `realtime_kline_service.py:1037-1402`
+**代码引用**: `src/utils/core/config.py:DEDUP_WINDOWS`, `src/services/realtime_kline_service.py:1037-1402`
 
 ### 6.4 同步与锁策略
 
@@ -1761,7 +1950,7 @@ with self.latest_data_lock:
 - 递归锁: 同一线程可多次获取
 - 适用场景: 嵌套调用、复杂操作
 
-**代码引用**: `enhanced_ws_manager.py:194-343`, `realtime_kline_service.py:183-189`
+**代码引用**: `enhanced_ws_manager.py:194-343`, `src/services/realtime_kline_service.py:183-189`
 
 #### threading.Lock
 
@@ -1789,7 +1978,7 @@ with self.blacklist_lock:
 - 简单锁: 不可递归
 - 适用场景: 简单临界区保护
 
-**代码引用**: `realtime_kline_service.py:193-205`
+**代码引用**: `src/services/realtime_kline_service.py:193-205`
 
 #### threading.Event
 
@@ -1824,7 +2013,7 @@ self.stop_ping.set()
 - 信号机制: wait/set
 - 适用场景: 线程间通信、同步
 
-**代码引用**: `realtime_kline_service.py:207`, `enhanced_ws_manager.py:501-597`
+**代码引用**: `src/services/realtime_kline_service.py:207`, `enhanced_ws_manager.py:501-597`
 
 ### 6.5 批量写入优化
 
@@ -1905,7 +2094,7 @@ def batch_upsert_copy(self, klines: List[Dict]) -> int:
 - 临时表: ON COMMIT DROP自动清理
 - 批量排序: 减少锁竞争
 
-**代码引用**: `timescaledb.py:342-450`
+**代码引用**: `src/utils/database/timescaledb.py:342-450`
 
 #### 死锁防护
 
@@ -1971,7 +2160,7 @@ def _batch_write_with_retry(self, batch: List[Dict], max_retries: int = 5) -> bo
 2. **指数退避重试**: 最大5次，递增等待时间
 3. **随机抖动**: 避免重试冲突
 
-**代码引用**: `realtime_kline_service.py:635-760`, `realtime_kline_service.py:294-373`
+**代码引用**: `src/services/realtime_kline_service.py:635-760`, `src/services/realtime_kline_service.py:294-373`
 
 ---
 
@@ -1989,7 +2178,7 @@ def _batch_write_with_retry(self, batch: List[Dict], max_retries: int = 5) -> bo
 
 **性能提升**: COPY方法比executemany快40-100倍
 
-**代码引用**: `timescaledb.py:342-450`
+**代码引用**: `src/utils/database/timescaledb.py:342-450`
 
 #### COPY优化技巧
 
@@ -2010,7 +2199,7 @@ dedup_batch = sorted(
 )
 ```
 
-**代码引用**: `timescaledb.py:342-450`, `realtime_kline_service.py:635-760`
+**代码引用**: `src/utils/database/timescaledb.py:342-450`, `src/services/realtime_kline_service.py:635-760`
 
 ### 7.2 缓存策略
 
@@ -2036,7 +2225,7 @@ self.latest_data = {
 - 最大容量: 10000条
 - 防止内存泄漏: 自动清理过期记录
 
-**代码引用**: `realtime_kline_service.py:193-205`, `enhanced_ws_manager.py:194-343`
+**代码引用**: `src/services/realtime_kline_service.py:193-205`, `enhanced_ws_manager.py:194-343`
 
 #### 定时清理任务
 
@@ -2061,7 +2250,7 @@ def _cleanup_recent_tasks(self):
 - 硬性上限: MAX_RECENT_TASKS=5000
 - 监控告警: 超过阈值触发清理
 
-**代码引用**: `utils/config.py:CLEANUP_INTERVAL`, `utils/config.py:MAX_RECENT_TASKS`
+**代码引用**: `src/utils/core/config.py:CLEANUP_INTERVAL`, `src/utils/core/config.py:MAX_RECENT_TASKS`
 
 ### 7.3 数据库查询优化
 
@@ -2121,7 +2310,7 @@ def get_klines_by_timeframe(
 - 防止OOM
 - 超过限制返回截断数据
 
-**代码引用**: `utils/config.py:DB_QUERY_LIMIT`, `timescaledb.py:487-589`
+**代码引用**: `src/utils/core/config.py:DB_QUERY_LIMIT`, `src/utils/database/timescaledb.py:487-589`
 
 ### 7.4 内存管理
 
@@ -2150,7 +2339,7 @@ def _monitor_memory_usage(self):
 - 队列大小限制
 - 定时清理任务
 
-**代码引用**: `realtime_kline_service.py:1713-1785`
+**代码引用**: `src/services/realtime_kline_service.py:1713-1785`
 
 ### 7.5 性能指标与监控
 
@@ -2164,7 +2353,7 @@ def _monitor_memory_usage(self):
 | CPU占用 | <50% | ~30% | `psutil.cpu_percent()` |
 | 批量写入性能 | >10K条/秒 | >40K条/秒 | COPY命令性能测试 |
 
-**代码引用**: `realtime_kline_service.py:27-31`
+**代码引用**: `src/services/realtime_kline_service.py:27-31`
 
 #### 实时统计
 
@@ -2190,7 +2379,7 @@ def get_stats(self) -> Dict:
     return self.stats
 ```
 
-**代码引用**: `realtime_kline_service.py:1661-1711`
+**代码引用**: `src/services/realtime_kline_service.py:1661-1711`
 
 #### 队列使用率监控
 
@@ -2224,7 +2413,7 @@ def _queue_health_monitor(self):
 - 告警阈值: 80%
 - 优化建议: 自动生成
 
-**代码引用**: `realtime_kline_service.py:1452-1539`, `utils/config.py:QUEUE_MONITOR_INTERVAL`, `utils/config.py:QUEUE_WARNING_THRESHOLD`
+**代码引用**: `src/services/realtime_kline_service.py:1452-1539`, `src/utils/core/config.py:QUEUE_MONITOR_INTERVAL`, `src/utils/core/config.py:QUEUE_WARNING_THRESHOLD`
 
 ---
 
@@ -2312,7 +2501,7 @@ def get_connection(self) -> Connection:
 3. 污染连接关闭并移除
 4. 健康连接返回连接池复用
 
-**代码引用**: `timescaledb.py:152-217`
+**代码引用**: `src/utils/database/timescaledb.py:152-217`
 
 #### 分析错误处理
 
@@ -2348,7 +2537,7 @@ def _analysis_worker(self):
 - 统计失败次数: analyses_failed
 - 日志记录: 完整堆栈信息
 
-**代码引用**: `realtime_kline_service.py:908-1035`
+**代码引用**: `src/services/realtime_kline_service.py:908-1035`
 
 ### 8.2 重试策略
 
@@ -2428,7 +2617,7 @@ def _batch_write_with_retry(self, batch: List[Dict], max_retries: int = 5) -> bo
 - 指数退避: 0.1s → 0.2s → 0.4s → 0.8s → 1.6s
 - 随机抖动: ±50%
 
-**代码引用**: `realtime_kline_service.py:294-373`
+**代码引用**: `src/services/realtime_kline_service.py:294-373`
 
 #### 飞书告警重试
 
@@ -2467,7 +2656,7 @@ def sender_colourful(webhook_url: str, msg: Dict, max_retries: int = 3) -> bool:
 - 请求超时: 10秒
 - 指数退避: 1s → 2s → 4s
 
-**代码引用**: `utils/lark_bot.py`
+**代码引用**: `src/utils/monitoring/lark_bot.py`
 
 ### 8.3 死锁防护
 
@@ -2506,7 +2695,7 @@ def _batch_writer(self):
 - 批量排序: 保证所有事务以相同顺序获取锁
 - 排序键: `(time, symbol, timeframe)`
 
-**代码引用**: `realtime_kline_service.py:635-760`
+**代码引用**: `src/services/realtime_kline_service.py:635-760`
 
 ### 8.4 降级策略
 
@@ -2547,7 +2736,7 @@ def _check_and_blacklist_new_symbol(self, symbol: str):
 - 取消该币种所有订阅 (5m/1h/4h)
 - 避免重复分析数据不足的新币
 
-**代码引用**: `realtime_kline_service.py:1179-1211`
+**代码引用**: `src/services/realtime_kline_service.py:1179-1211`
 
 #### 协整健康恶化处理
 
@@ -2578,7 +2767,7 @@ def _analyze_and_alert(self, task: Dict):
 - 短期窗口状态非HEALTHY → 不发送告警
 - 避免协整关系恶化时的虚假信号
 
-**代码引用**: `realtime_kline_service.py:1037-1402`
+**代码引用**: `src/services/realtime_kline_service.py:1037-1402`
 
 #### 队列满丢弃
 
@@ -2602,7 +2791,7 @@ def _enqueue_analysis_if_needed(self, symbol: str, timeframe: str, kline_time: d
 - analysis_queue满 → 跳过分析，记录丢弃数
 - analysis_result_buffer满 → 跳过保存，记录丢弃数
 
-**代码引用**: `realtime_kline_service.py:575-633`
+**代码引用**: `src/services/realtime_kline_service.py:575-633`
 
 ### 8.5 健康监控
 
@@ -2676,7 +2865,7 @@ def _queue_health_monitor(self):
 - 告警阈值: 80%
 - 优化建议: 自动生成
 
-**代码引用**: `realtime_kline_service.py:1452-1539`
+**代码引用**: `src/services/realtime_kline_service.py:1452-1539`
 
 #### 数据库健康监控
 
@@ -2706,7 +2895,7 @@ def get_pool_stats(self) -> Dict:
 - 连接测试: `SELECT 1`
 - 连接池使用率: `(size - available) / size`
 
-**代码引用**: `timescaledb.py:218-273`
+**代码引用**: `src/utils/database/timescaledb.py:218-273`
 
 ---
 
@@ -2732,7 +2921,7 @@ def get_pool_stats(self) -> Dict:
 | 连接 | ws_health_percentage | WebSocket健康度 | <50% |
 | 连接 | db_pool_usage | 数据库连接池使用率 | >90% |
 
-**代码引用**: `realtime_kline_service.py:1661-1711`
+**代码引用**: `src/services/realtime_kline_service.py:1661-1711`
 
 #### 统计信息收集
 
@@ -2772,7 +2961,7 @@ def print_stats_report(self):
     )
 ```
 
-**代码引用**: `realtime_kline_service.py:1661-1711`
+**代码引用**: `src/services/realtime_kline_service.py:1661-1711`
 
 ### 9.2 飞书告警格式化
 
@@ -2942,7 +3131,7 @@ ADF p值: 0.0023
 K线时间: 2026-01-30 12:00:00 | 分析延迟: 3.45秒
 ```
 
-**代码引用**: `utils/alert_formatter.py`
+**代码引用**: `src/utils/monitoring/alert_formatter.py`
 
 ### 9.3 系统级告警
 
@@ -3007,7 +3196,7 @@ def _send_queue_alert(self, queue_name: str, usage: float):
 **告警触发**:
 - 队列使用率 > 80%
 
-**代码引用**: `realtime_kline_service.py:1452-1539`
+**代码引用**: `src/services/realtime_kline_service.py:1452-1539`
 
 #### 内存过载告警
 
@@ -3037,7 +3226,7 @@ def _monitor_memory_usage(self):
 **告警触发**:
 - 内存占用 > 512MB
 
-**代码引用**: `realtime_kline_service.py:1713-1785`
+**代码引用**: `src/services/realtime_kline_service.py:1713-1785`
 
 ### 9.4 数据补充与校验
 
@@ -3081,7 +3270,7 @@ def check_data_continuity(
 - 对比预期时间间隔
 - 允许5秒误差
 
-**代码引用**: `utils/kline_data_filler.py`
+**代码引用**: `src/utils/analysis/kline_data_filler.py`
 
 #### 自动数据补充
 
@@ -3145,7 +3334,7 @@ def fill_missing_klines(
 - 批量写入数据库
 - 重新校验连续性
 
-**代码引用**: `utils/kline_data_filler.py`
+**代码引用**: `src/utils/analysis/kline_data_filler.py`
 
 ---
 
@@ -3187,7 +3376,7 @@ services:
   realtime_service:
     build:
       context: .
-      dockerfile: Dockerfile.realtime
+      dockerfile: Dockerfile  # 需自行创建（参考上方模板）
     container_name: crypto_realtime_service
     depends_on:
       - timescaledb
@@ -3198,6 +3387,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: crypto_data
       LARK_WEBHOOK_URL: ${LARK_WEBHOOK_URL}
+      SERVICE_VERSION: ${SERVICE_VERSION:-general}  # general 或 hype
     restart: unless-stopped
     volumes:
       - ./realtime_kline_service.log:/app/realtime_kline_service.log
@@ -3212,8 +3402,22 @@ volumes:
 
 **代码引用**: `docker-compose.yml`
 
-#### Dockerfile配置
+#### Dockerfile 配置
 
+**⚠️ 重要变更**: 原 `docker/Dockerfile.realtime` 已删除（提交 `fee7e19` - "restruct director"）
+
+**当前部署方式**:
+
+**1. 开发环境** - 直接运行 Python 脚本:
+```bash
+# 通用版
+python src/services/realtime_kline_service.py
+
+# HYPE版
+python src/services/realtime_kline_service_hype.py
+```
+
+**2. 生产环境** - 需自行创建 Dockerfile（参考模板）:
 ```dockerfile
 FROM python:3.12-slim
 
@@ -3232,17 +3436,25 @@ RUN pip install --no-cache-dir uv && \
     uv pip install --system -r pyproject.toml
 
 # 复制应用代码
-COPY . .
+COPY src/ ./src/
 
 # 健康检查
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import psycopg; conn = psycopg.connect('dbname=crypto_data user=postgres host=timescaledb'); conn.close()" || exit 1
 
-# 启动服务
-CMD ["python", "realtime_kline_service.py"]
+# 启动服务（通用版）
+CMD ["python", "src/services/realtime_kline_service.py"]
+
+# 或启动HYPE版
+# CMD ["python", "src/services/realtime_kline_service_hype.py"]
 ```
 
-**代码引用**: `Dockerfile.realtime`
+**变更说明**:
+- ✅ 代码引用路径更新为 `src/` 结构
+- ✅ 支持通用版和HYPE版两种启动方式
+- ❌ 原 `Dockerfile.realtime` 已被删除，需自行创建
+
+**相关提交**: `fee7e19` - "restruct director"
 
 ### 10.2 环境配置管理
 
@@ -3303,7 +3515,7 @@ DEFAULT_TIMEFRAMES = os.getenv('DEFAULT_TIMEFRAMES', '5m,1h,4h').split(',')
 ANALYSIS_WORKERS_GENERAL = int(os.getenv('ANALYSIS_WORKERS_GENERAL', 15))
 ```
 
-**代码引用**: `utils/config.py`
+**代码引用**: `src/utils/core/config.py`
 
 ### 10.3 资源限制策略
 
@@ -3345,7 +3557,7 @@ ANALYSIS_WORKERS_GENERAL = 15
 DB_QUERY_LIMIT = 10000
 ```
 
-**代码引用**: `utils/config.py`
+**代码引用**: `src/utils/core/config.py`
 
 ### 10.4 运维方案
 
@@ -3429,7 +3641,7 @@ ANALYSIS_RESULT_BATCH_TIMEOUT = 2.0
 ANALYSIS_USE_COPY_METHOD = True  # 使用COPY命令
 ```
 
-**代码引用**: `utils/config.py:DEFAULT_BASE_SYMBOL`, `utils/config.py:DEFAULT_TIMEFRAMES`
+**代码引用**: `src/utils/core/config.py:DEFAULT_BASE_SYMBOL`, `src/utils/core/config.py:DEFAULT_TIMEFRAMES`
 
 #### 数据窗口配置
 
@@ -3451,7 +3663,7 @@ MIN_DATA_POINTS = {
 MIN_4H_DATA_POINTS = 358  # 新币种4H数据点阈值
 ```
 
-**代码引用**: `utils/config.py:DATA_WINDOW_CONFIG`, `utils/config.py:MIN_DATA_POINTS`
+**代码引用**: `src/utils/core/config.py:DATA_WINDOW_CONFIG`, `src/utils/core/config.py:MIN_DATA_POINTS`
 
 #### 分析参数配置
 
@@ -3481,7 +3693,7 @@ ALPHA_CROSS_ASSET_THRESHOLD = 5.0 # 跨资产类阈值
 ALPHA_SAME_ASSET_THRESHOLD = 2.0  # 同类资产阈值
 ```
 
-**代码引用**: `utils/config.py:TARGET_CORR_THRESHOLD`, `utils/config.py:BETA_WINDOW`, `utils/config.py:ZSCORE_THRESHOLDS`
+**代码引用**: `src/utils/core/config.py:TARGET_CORR_THRESHOLD`, `src/utils/core/config.py:BETA_WINDOW`, `src/utils/core/config.py:ZSCORE_THRESHOLDS`
 
 ### 11.2 性能调优参数
 
@@ -3500,7 +3712,7 @@ QUEUE_WARNING_THRESHOLD = 0.8   # 告警阈值（80%）
 QUEUE_GET_TIMEOUT = 1.0         # 队列获取超时（秒）
 ```
 
-**代码引用**: `utils/config.py:QUEUE_CONFIG_GENERAL`
+**代码引用**: `src/utils/core/config.py:QUEUE_CONFIG_GENERAL`
 
 #### 工作线程配置
 
@@ -3513,7 +3725,7 @@ WORKER_THREAD_SHUTDOWN_TIMEOUT = 30    # 工作线程关闭超时（秒）
 MAIN_THREAD_SHUTDOWN_TIMEOUT = 60      # 主线程关闭超时（秒）
 ```
 
-**代码引用**: `utils/config.py:ANALYSIS_WORKERS_GENERAL`
+**代码引用**: `src/utils/core/config.py:ANALYSIS_WORKERS_GENERAL`
 
 #### 去重配置
 
@@ -3537,7 +3749,7 @@ CLEANUP_INTERVAL = 300       # 清理间隔（秒）
 MAX_RECENT_TASKS = 5000      # 最大缓存任务数
 ```
 
-**代码引用**: `utils/config.py:ENQUEUE_DEDUP_WINDOWS`, `utils/config.py:DEDUP_WINDOWS`
+**代码引用**: `src/utils/core/config.py:ENQUEUE_DEDUP_WINDOWS`, `src/utils/core/config.py:DEDUP_WINDOWS`
 
 #### 数据库配置
 
@@ -3553,7 +3765,7 @@ POOL_MAX_IDLE = 600          # 最大空闲时间（秒）
 DB_QUERY_LIMIT = 10000       # 单次查询最大返回条数
 ```
 
-**代码引用**: `utils/config.py:POOL_MIN_SIZE`, `utils/config.py:DB_QUERY_LIMIT`
+**代码引用**: `src/utils/core/config.py:POOL_MIN_SIZE`, `src/utils/core/config.py:DB_QUERY_LIMIT`
 
 ### 11.3 WebSocket配置
 
@@ -3587,7 +3799,7 @@ WS_READY_TIMEOUT = 30                   # 就绪超时（秒）
 WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
 ```
 
-**代码引用**: `utils/config.py:WS_URL`, `utils/config.py:WS_PING_INTERVAL_MS`
+**代码引用**: `src/utils/core/config.py:WS_URL`, `src/utils/core/config.py:WS_PING_INTERVAL_MS`
 
 ---
 
@@ -3610,7 +3822,7 @@ WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
 - ❌ 订阅数增加 (N个币种 × 3周期)
 - ✅ 1h/4h推送频率极低，实际影响可忽略
 
-**代码引用**: `realtime_kline_service.py:22-26`
+**代码引用**: `src/services/realtime_kline_service.py:22-26`
 
 #### 2. Old方法 vs New方法协整检验
 
@@ -3625,7 +3837,7 @@ WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
 - ❌ 计算量增加 (6次协整检验)
 - ✅ 信号质量显著提升
 
-**代码引用**: `utils/analysis_core.py:185-407`, `utils/config.py:REQUIRED_PERIODS`
+**代码引用**: `src/utils/analysis/analysis_core.py:185-407`, `src/utils/core/config.py:REQUIRED_PERIODS`
 
 #### 3. COPY批量写入 vs executemany
 
@@ -3640,7 +3852,7 @@ WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
 - ❌ 代码复杂度略高
 - ✅ 性能提升远超复杂度成本
 
-**代码引用**: `timescaledb.py:342-450`
+**代码引用**: `src/utils/database/timescaledb.py:342-450`
 
 #### 4. 多线程 vs 异步IO
 
@@ -3656,7 +3868,7 @@ WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
 - ❌ 线程上下文切换开销
 - ✅ 15线程规模可接受，避免asyncio生态碎片化
 
-**代码引用**: `realtime_kline_service.py:224-275`
+**代码引用**: `src/services/realtime_kline_service.py:224-275`
 
 ### 12.2 技术权衡分析
 
@@ -3701,7 +3913,7 @@ WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
    - 优化批量写入 (动态批量大小)
    - 优化分析线程数 (自适应线程池)
 
-**代码引用**: `utils/coingetation_more_check.py`
+**代码引用**: `src/utils/analysis/coingetation_more_check.py`
 
 #### 中期优化 (3-6个月)
 
