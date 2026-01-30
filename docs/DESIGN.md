@@ -2228,3 +2228,1556 @@ def _queue_health_monitor(self):
 
 ---
 
+## 8. 可靠性设计
+
+### 8.1 错误处理机制
+
+#### WebSocket错误处理
+
+```python
+def on_error(self, ws, error):
+    """WebSocket错误回调"""
+    logger.error(f"WebSocket错误: {error}")
+    # 记录错误日志，由on_close触发重连
+
+def on_close(self, ws, close_status_code, close_msg):
+    """WebSocket关闭回调"""
+    logger.warning(f"WebSocket连接关闭 | 状态码: {close_status_code} | 消息: {close_msg}")
+
+    # 清除就绪标志
+    self.ws_ready_event.clear()
+
+    # 更新状态
+    with self.state_lock:
+        if self.state != ConnectionState.FAILED:
+            self.state = ConnectionState.DISCONNECTED
+
+    # 非正常关闭触发重连
+    if close_status_code not in [1000, 1001]:  # 1000=正常关闭, 1001=Going Away
+        logger.info("检测到非正常关闭，触发重连")
+        self._reconnect_with_backoff()
+```
+
+**错误分类**:
+- 网络错误: 自动重连
+- 协议错误: 记录日志
+- 业务错误: 跳过处理
+
+**代码引用**: `enhanced_ws_manager.py:830-891`
+
+#### 数据库错误处理
+
+```python
+@contextmanager
+def get_connection(self) -> Connection:
+    """
+    获取数据库连接（连接污染检测）
+
+    异常处理:
+    - 正常退出: 自动提交事务
+    - 异常退出: 自动回滚事务
+    - 连接污染: 测试连接可用性，移除污染连接
+    """
+    conn = None
+    connection_valid = True
+
+    try:
+        conn = self._pool.getconn()
+        yield conn
+        conn.commit()
+    except Exception as e:
+        if conn:
+            try:
+                conn.rollback()
+                # 测试连接是否仍然可用
+                with conn.cursor() as test_cur:
+                    test_cur.execute("SELECT 1")
+            except Exception as test_e:
+                # 连接已污染
+                logger.error(f"连接已污染，将其移除: {test_e}")
+                connection_valid = False
+        logger.error(f"数据库连接错误: {e}")
+        raise
+    finally:
+        if conn:
+            if connection_valid:
+                self._pool.putconn(conn)  # 健康连接复用
+            else:
+                self._pool.putconn(conn, close=True)  # 污染连接移除
+```
+
+**连接污染检测**:
+1. 异常后执行 `SELECT 1` 测试
+2. 测试失败 → 标记为污染连接
+3. 污染连接关闭并移除
+4. 健康连接返回连接池复用
+
+**代码引用**: `timescaledb.py:152-217`
+
+#### 分析错误处理
+
+```python
+def _analysis_worker(self):
+    """分析工作线程（错误隔离）"""
+    while not self.stop_event.is_set():
+        try:
+            # 获取分析任务
+            task = self.analysis_queue.get(timeout=QUEUE_GET_TIMEOUT)
+
+            # 执行分析
+            result = self._analyze_and_alert(task)
+
+            if result:
+                # 入队分析结果
+                self.analysis_result_buffer.put_nowait(result)
+                self.stats['analyses_completed'] += 1
+            else:
+                self.stats['analyses_failed'] += 1
+
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logger.error(f"分析工作线程异常: {e}", exc_info=True)
+            self.stats['analyses_failed'] += 1
+            # 单个分析失败不影响其他任务
+            continue
+```
+
+**错误隔离**:
+- try-except包裹: 单个分析失败不影响其他
+- 统计失败次数: analyses_failed
+- 日志记录: 完整堆栈信息
+
+**代码引用**: `realtime_kline_service.py:908-1035`
+
+### 8.2 重试策略
+
+#### WebSocket重连
+
+```python
+def _reconnect_with_backoff(self):
+    """指数退避重连"""
+    while not self.stop_event.is_set():
+        # 获取延迟时间
+        delay = self.reconnection_manager.get_delay()
+
+        logger.info(
+            f"第{self.reconnection_manager.current_attempt+1}次重连尝试，"
+            f"等待{delay:.2f}秒"
+        )
+
+        # 等待延迟
+        time.sleep(delay)
+
+        # 尝试重连
+        success = self._connect()
+
+        if success:
+            logger.info("重连成功")
+            self.reconnection_manager.reset()
+            break
+        else:
+            self.reconnection_manager.increment_attempt()
+
+            # 检查最大重试次数
+            if self.reconnection_manager.should_give_up():
+                logger.error(f"重连失败{self.reconnection_manager.max_retries}次，放弃重连")
+                with self.state_lock:
+                    self.state = ConnectionState.FAILED
+                break
+
+            # 告警机制: 第5次失败发送告警
+            if self.reconnection_manager.current_attempt == WS_ALERT_THRESHOLD:
+                self._send_alert_on_failure()
+```
+
+**重连策略**:
+- 指数退避: 1s → 2s → 4s → 8s → 16s → 32s → 60s
+- 随机抖动: ±25%
+- 最大重试: 30次
+- 告警机制: 第5次失败发送告警
+
+**代码引用**: `enhanced_ws_manager.py:1009-1076`
+
+#### 数据库死锁重试
+
+```python
+def _batch_write_with_retry(self, batch: List[Dict], max_retries: int = 5) -> bool:
+    """批量写入（死锁重试）"""
+    for attempt in range(max_retries):
+        try:
+            self.kline_repo.batch_upsert_copy(batch)
+            return True
+        except psycopg.errors.DeadlockDetected as e:
+            if attempt < max_retries - 1:
+                # 指数退避 + 随机抖动
+                wait_time = 0.1 * (2 ** attempt) * (1 + random.random() * 0.5)
+                logger.warning(f"死锁检测，第{attempt+1}次重试，等待{wait_time:.2f}秒")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"死锁重试{max_retries}次后仍然失败")
+                return False
+        except Exception as e:
+            logger.error(f"批量写入失败: {e}")
+            return False
+```
+
+**死锁重试策略**:
+- 最大重试: 5次
+- 指数退避: 0.1s → 0.2s → 0.4s → 0.8s → 1.6s
+- 随机抖动: ±50%
+
+**代码引用**: `realtime_kline_service.py:294-373`
+
+#### 飞书告警重试
+
+```python
+def sender_colourful(webhook_url: str, msg: Dict, max_retries: int = 3) -> bool:
+    """发送飞书告警（重试机制）"""
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                webhook_url,
+                json=msg,
+                timeout=10,  # 10秒超时
+                headers={"Content-Type": "application/json"}
+            )
+
+            if response.status_code == 200:
+                logger.info("飞书告警发送成功")
+                return True
+            else:
+                logger.warning(f"飞书告警发送失败: {response.status_code} {response.text}")
+
+        except requests.RequestException as e:
+            logger.error(f"飞书告警发送异常 (尝试{attempt+1}/{max_retries}): {e}")
+
+        # 指数退避
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt
+            time.sleep(wait_time)
+
+    logger.error(f"飞书告警发送失败，已重试{max_retries}次")
+    return False
+```
+
+**告警重试策略**:
+- 最大重试: 3次
+- 请求超时: 10秒
+- 指数退避: 1s → 2s → 4s
+
+**代码引用**: `utils/lark_bot.py`
+
+### 8.3 死锁防护
+
+#### 批量排序策略
+
+```python
+def _batch_writer(self):
+    """K线批量写入线程（死锁防护）"""
+    batch = []
+
+    while not self.stop_event.is_set():
+        # ... 批量获取数据 ...
+
+        # 去重
+        dedup_batch = self._deduplicate_batch(batch)
+
+        # 关键: 批量排序，保证锁获取顺序一致
+        dedup_batch = sorted(
+            dedup_batch,
+            key=lambda x: (x['time'], x['symbol'], x['timeframe'])
+        )
+
+        # 批量写入（死锁重试）
+        success = self._batch_write_with_retry(dedup_batch, max_retries=5)
+
+        if success:
+            batch.clear()
+            last_flush_time = time.time()
+```
+
+**死锁原因**:
+- 多个事务以不同顺序获取锁
+- 例如: 事务A锁定行1→行2，事务B锁定行2→行1
+
+**防护策略**:
+- 批量排序: 保证所有事务以相同顺序获取锁
+- 排序键: `(time, symbol, timeframe)`
+
+**代码引用**: `realtime_kline_service.py:635-760`
+
+### 8.4 降级策略
+
+#### 新币数据不足处理
+
+```python
+def _check_and_blacklist_new_symbol(self, symbol: str):
+    """检查新币数据是否充足，不足则加入黑名单"""
+    # 检查4H数据点
+    klines_4h = self.kline_repo.get_klines_by_timeframe(
+        symbol=symbol,
+        timeframe='4h',
+        start_time=datetime.now(timezone.utc) - timedelta(days=60),
+        end_time=datetime.now(timezone.utc)
+    )
+
+    if len(klines_4h) < MIN_4H_DATA_POINTS:  # 358个点
+        logger.warning(
+            f"新币种 {symbol} 4H数据点不足 ({len(klines_4h)} < {MIN_4H_DATA_POINTS})，"
+            f"加入黑名单并取消订阅"
+        )
+
+        # 加入黑名单
+        with self.blacklist_lock:
+            self.new_symbol_blacklist.add(symbol)
+
+        # 取消该币种所有订阅
+        self._unsubscribe_symbol(symbol)
+
+        return True
+    else:
+        logger.info(f"新币种 {symbol} 数据充足，可以正常分析")
+        return False
+```
+
+**降级策略**:
+- 检查4H数据点 < 358 → 加入黑名单
+- 取消该币种所有订阅 (5m/1h/4h)
+- 避免重复分析数据不足的新币
+
+**代码引用**: `realtime_kline_service.py:1179-1211`
+
+#### 协整健康恶化处理
+
+```python
+def _analyze_and_alert(self, task: Dict):
+    """分析并告警（协整健康约束）"""
+    # ... 多周期协整验证 ...
+
+    # 检查协整健康状态
+    health_result = calculate_cointegration_health(
+        base_klines_5m,
+        alt_klines_5m,
+        long_window=200,
+        short_window=100
+    )
+
+    # 短期窗口状态非HEALTHY → 不发送告警
+    if health_result['short_window_state'] != "HEALTHY":
+        logger.debug(
+            f"协整健康状态不佳 ({health_result['short_window_state']})，跳过告警"
+        )
+        return None
+
+    # ... 发送告警 ...
+```
+
+**降级策略**:
+- 短期窗口状态非HEALTHY → 不发送告警
+- 避免协整关系恶化时的虚假信号
+
+**代码引用**: `realtime_kline_service.py:1037-1402`
+
+#### 队列满丢弃
+
+```python
+def _enqueue_analysis_if_needed(self, symbol: str, timeframe: str, kline_time: datetime):
+    """入队分析任务（队列满丢弃）"""
+    with self.recent_enqueue_lock:
+        # ... 去重检查 ...
+
+        # 入队
+        try:
+            self.analysis_queue.put_nowait(task)
+            return True
+        except queue.Full:
+            logger.warning(f"分析队列已满，跳过任务: {symbol} {timeframe}")
+            self.stats['analyses_dropped'] += 1
+            return False
+```
+
+**降级策略**:
+- analysis_queue满 → 跳过分析，记录丢弃数
+- analysis_result_buffer满 → 跳过保存，记录丢弃数
+
+**代码引用**: `realtime_kline_service.py:575-633`
+
+### 8.5 健康监控
+
+#### WebSocket健康监控
+
+```python
+def _health_check_loop(self):
+    """健康检查循环（每2秒）"""
+    while not self.stop_event.is_set():
+        time.sleep(WS_HEALTH_CHECK_INTERVAL)  # 2秒
+
+        # 底层连接检测
+        is_connected_base = self._is_connected_base()
+
+        # 应用层心跳检测
+        is_alive, idle_time = self.health_monitor.is_alive()
+
+        # 双重检测: 底层连接正常 + 应用层存活
+        if is_connected_base and not is_alive:
+            logger.error(
+                f"假活检测: 底层连接正常，但{idle_time:.1f}秒未收到数据，触发重连"
+            )
+            self._force_cleanup_and_reconnect()
+
+        # 定期健康报告（每60秒）
+        if int(time.time()) % WS_HEALTH_REPORT_INTERVAL == 0:
+            health_pct = self.health_monitor.get_health_percentage()
+            logger.info(
+                f"WebSocket健康报告 | 连接: {is_connected_base} | "
+                f"健康度: {health_pct:.1f}% | "
+                f"消息数: {self.health_monitor.message_count}"
+            )
+```
+
+**健康指标**:
+- 底层连接: `ws.keep_running`, `ws_ready_event`, `ws_thread.is_alive()`
+- 应用层心跳: 最后消息时间，15秒超时
+- 健康度百分比: 0-100%
+
+**代码引用**: `enhanced_ws_manager.py:893-975`
+
+#### 队列健康监控
+
+```python
+def _queue_health_monitor(self):
+    """队列使用率监控（每60秒）"""
+    while not self.stop_event.is_set():
+        time.sleep(QUEUE_MONITOR_INTERVAL)
+
+        kline_usage = self.kline_buffer.qsize() / QUEUE_CONFIG_GENERAL['kline_buffer_size']
+        analysis_usage = self.analysis_queue.qsize() / QUEUE_CONFIG_GENERAL['analysis_queue_size']
+        result_usage = self.analysis_result_buffer.qsize() / QUEUE_CONFIG_GENERAL['analysis_result_buffer_size']
+
+        logger.info(
+            f"队列使用率 | K线: {kline_usage*100:.1f}% | "
+            f"分析: {analysis_usage*100:.1f}% | "
+            f"结果: {result_usage*100:.1f}%"
+        )
+
+        # 告警阈值: 80%
+        if kline_usage > QUEUE_WARNING_THRESHOLD:
+            logger.warning("K线队列使用率超过80%，建议增加批量写入频率")
+        if analysis_usage > QUEUE_WARNING_THRESHOLD:
+            logger.warning("分析队列使用率超过80%，建议增加工作线程数")
+        if result_usage > QUEUE_WARNING_THRESHOLD:
+            logger.warning("结果队列使用率超过80%，建议检查数据库性能")
+```
+
+**监控指标**:
+- 队列使用率: 每60秒输出
+- 告警阈值: 80%
+- 优化建议: 自动生成
+
+**代码引用**: `realtime_kline_service.py:1452-1539`
+
+#### 数据库健康监控
+
+```python
+def health_check(self) -> bool:
+    """数据库健康检查"""
+    try:
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                result = cur.fetchone()
+                return result[0] == 1
+    except Exception as e:
+        logger.error(f"数据库健康检查失败: {e}")
+        return False
+
+def get_pool_stats(self) -> Dict:
+    """连接池统计信息"""
+    return {
+        'pool_size': self._pool.size,
+        'pool_available': self._pool.available,
+        'pool_usage': (self._pool.size - self._pool.available) / self._pool.size * 100
+    }
+```
+
+**健康指标**:
+- 连接测试: `SELECT 1`
+- 连接池使用率: `(size - available) / size`
+
+**代码引用**: `timescaledb.py:218-273`
+
+---
+
+## 9. 监控与告警
+
+### 9.1 实时监控指标
+
+#### 核心指标
+
+| 指标类别 | 指标名称 | 计算方式 | 告警阈值 |
+|---------|---------|---------|---------|
+| 吞吐量 | messages_received | WebSocket消息计数 | - |
+| 吞吐量 | klines_written | K线写入计数 | - |
+| 吞吐量 | analyses_completed | 分析完成计数 | - |
+| 质量 | analyses_failed | 分析失败计数 | >10/分钟 |
+| 质量 | analyses_dropped | 分析丢弃计数 | >5/分钟 |
+| 延迟 | analysis_delay_seconds | kline_time → analysis_time | >10秒 |
+| 资源 | queue_kline_usage | kline_buffer使用率 | >80% |
+| 资源 | queue_analysis_usage | analysis_queue使用率 | >80% |
+| 资源 | queue_result_usage | result_buffer使用率 | >80% |
+| 资源 | memory_usage_mb | 进程内存占用 | >512MB |
+| 资源 | cpu_usage_percent | CPU使用率 | >70% |
+| 连接 | ws_health_percentage | WebSocket健康度 | <50% |
+| 连接 | db_pool_usage | 数据库连接池使用率 | >90% |
+
+**代码引用**: `realtime_kline_service.py:1661-1711`
+
+#### 统计信息收集
+
+```python
+self.stats = {
+    'messages_received': 0,
+    'klines_written': 0,
+    'analyses_completed': 0,
+    'analyses_failed': 0,
+    'analyses_dropped': 0,
+    'alerts_sent': 0,
+    'uptime_seconds': 0,
+    'queue_kline_size': 0,
+    'queue_analysis_size': 0,
+    'queue_result_size': 0
+}
+
+def get_stats(self) -> Dict:
+    """获取实时统计信息"""
+    self.stats['uptime_seconds'] = time.time() - self.start_time
+    self.stats['queue_kline_size'] = self.kline_buffer.qsize()
+    self.stats['queue_analysis_size'] = self.analysis_queue.qsize()
+    self.stats['queue_result_size'] = self.analysis_result_buffer.qsize()
+    return self.stats
+
+def print_stats_report(self):
+    """打印统计报告"""
+    stats = self.get_stats()
+    logger.info(
+        f"统计报告 | "
+        f"运行时长: {stats['uptime_seconds']/3600:.2f}小时 | "
+        f"消息总数: {stats['messages_received']} | "
+        f"K线写入: {stats['klines_written']} | "
+        f"分析完成: {stats['analyses_completed']} | "
+        f"分析失败: {stats['analyses_failed']} | "
+        f"告警发送: {stats['alerts_sent']}"
+    )
+```
+
+**代码引用**: `realtime_kline_service.py:1661-1711`
+
+### 9.2 飞书告警格式化
+
+#### 告警消息结构
+
+```python
+def format_anomaly_alert(
+    symbol: str,
+    base_symbol: str,
+    analysis_result: Dict,
+    timeframe: str = '5m'
+) -> Dict:
+    """
+    格式化异常告警消息（飞书富文本）
+
+    消息结构:
+    - 标题: 🚨 配对交易信号
+    - 币种信息: 目标币种 vs 基准币种
+    - 信号强度: 🔥HIGH / ⚡MEDIUM / 💡LOW
+    - 交易方向: 🔻做空 / 🔺做多
+    - 多周期数据: 5m/1h/4h相关系数和Z-score
+    - 协整信息: 通过数/总数, ADF p值
+    - 时间链路: K线时间, 分析时间, 延迟
+    """
+    # 计算信号强度
+    signal_strength = _calculate_signal_strength(analysis_result)
+
+    # 构建飞书消息
+    message = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {
+                    "content": "🚨 配对交易信号",
+                    "tag": "plain_text"
+                },
+                "template": "red"  # 红色主题
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "fields": [
+                        {
+                            "is_short": True,
+                            "text": {
+                                "tag": "lark_md",
+                                "content": f"**目标币种**\n{symbol}"
+                            }
+                        },
+                        {
+                            "is_short": True,
+                            "text": {
+                                "tag": "lark_md",
+                                "content": f"**基准币种**\n{base_symbol}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "tag": "div",
+                    "fields": [
+                        {
+                            "is_short": True,
+                            "text": {
+                                "tag": "lark_md",
+                                "content": f"**信号强度**\n{signal_strength}"
+                            }
+                        },
+                        {
+                            "is_short": True,
+                            "text": {
+                                "tag": "lark_md",
+                                "content": f"**交易方向**\n{trading_direction}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "tag": "hr"
+                },
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": (
+                            f"**多周期数据**\n"
+                            f"5m: 相关系数={corr_5m:.4f}, Z-score={zscore_5m:.2f}\n"
+                            f"1h: 相关系数={corr_1h:.4f}, Z-score={zscore_1h:.2f}\n"
+                            f"4h: 相关系数={corr_4h:.4f}, Z-score={zscore_4h:.2f}"
+                        )
+                    }
+                },
+                {
+                    "tag": "div",
+                    "text": {
+                        "tag": "lark_md",
+                        "content": (
+                            f"**协整信息**\n"
+                            f"通过数: {passed_count}/6\n"
+                            f"ADF p值: {adf_pvalue:.4f}"
+                        )
+                    }
+                },
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": f"K线时间: {kline_time} | 分析延迟: {delay:.2f}秒"
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    return message
+
+def _calculate_signal_strength(analysis_result: Dict) -> str:
+    """
+    计算信号强度
+
+    规则:
+    - HIGH: 所有3个周期Z-score超阈值
+    - MEDIUM: 2个周期Z-score超阈值
+    - LOW: 1个周期Z-score超阈值
+    """
+    zscore_5m = abs(analysis_result.get('zscore_5m', 0))
+    zscore_1h = abs(analysis_result.get('zscore_1h', 0))
+    zscore_4h = abs(analysis_result.get('zscore_4h', 0))
+
+    exceeds_count = sum([
+        zscore_5m > ZSCORE_THRESHOLDS['5m'],
+        zscore_1h > ZSCORE_THRESHOLDS['1h'],
+        zscore_4h > ZSCORE_THRESHOLDS['4h']
+    ])
+
+    if exceeds_count == 3:
+        return "🔥 HIGH"
+    elif exceeds_count == 2:
+        return "⚡ MEDIUM"
+    else:
+        return "💡 LOW"
+```
+
+**告警示例**:
+```
+🚨 配对交易信号
+
+目标币种: NEAR/USDC:USDC
+基准币种: BTC/USDC:USDC
+
+信号强度: 🔥 HIGH
+交易方向: 🔻 做空配对
+
+─────────────────────
+
+多周期数据:
+5m: 相关系数=0.8523, Z-score=2.34
+1h: 相关系数=0.8156, Z-score=1.87
+4h: 相关系数=0.7891, Z-score=0.45
+
+协整信息:
+通过数: 5/6
+ADF p值: 0.0023
+
+K线时间: 2026-01-30 12:00:00 | 分析延迟: 3.45秒
+```
+
+**代码引用**: `utils/alert_formatter.py`
+
+### 9.3 系统级告警
+
+#### WebSocket连接告警
+
+```python
+def _send_alert_on_failure(self):
+    """WebSocket重连失败告警"""
+    message = {
+        "msg_type": "text",
+        "content": {
+            "text": (
+                f"⚠️ WebSocket连接告警\n"
+                f"连接状态: {self.state.value}\n"
+                f"重连尝试: {self.reconnection_manager.current_attempt}次\n"
+                f"最后错误: {self.last_error}\n"
+                f"建议: 检查网络连接和服务器状态"
+            )
+        }
+    }
+    sender_colourful(lark_webhook_url, message)
+```
+
+**告警触发**:
+- 第5次重连失败
+- 连接状态 = FAILED
+
+**代码引用**: `enhanced_ws_manager.py:1009-1076`
+
+#### 队列过载告警
+
+```python
+def _queue_health_monitor(self):
+    """队列使用率监控（告警）"""
+    # ... 队列使用率计算 ...
+
+    if kline_usage > QUEUE_WARNING_THRESHOLD:
+        logger.warning("K线队列使用率超过80%")
+        # 发送飞书告警
+        self._send_queue_alert("K线队列", kline_usage)
+
+    if analysis_usage > QUEUE_WARNING_THRESHOLD:
+        logger.warning("分析队列使用率超过80%")
+        self._send_queue_alert("分析队列", analysis_usage)
+
+def _send_queue_alert(self, queue_name: str, usage: float):
+    """发送队列过载告警"""
+    message = {
+        "msg_type": "text",
+        "content": {
+            "text": (
+                f"⚠️ 队列过载告警\n"
+                f"队列名称: {queue_name}\n"
+                f"使用率: {usage*100:.1f}%\n"
+                f"建议: 增加处理线程或批量写入频率"
+            )
+        }
+    }
+    sender_colourful(lark_webhook_url, message)
+```
+
+**告警触发**:
+- 队列使用率 > 80%
+
+**代码引用**: `realtime_kline_service.py:1452-1539`
+
+#### 内存过载告警
+
+```python
+def _monitor_memory_usage(self):
+    """内存占用监控（告警）"""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+
+    if memory_info.rss > 512 * 1024 * 1024:  # 512MB
+        logger.warning("内存占用超过512MB")
+
+        # 发送飞书告警
+        message = {
+            "msg_type": "text",
+            "content": {
+                "text": (
+                    f"⚠️ 内存过载告警\n"
+                    f"内存占用: {memory_info.rss / 1024 / 1024:.2f}MB\n"
+                    f"建议: 检查内存泄漏，清理缓存"
+                )
+            }
+        }
+        sender_colourful(lark_webhook_url, message)
+```
+
+**告警触发**:
+- 内存占用 > 512MB
+
+**代码引用**: `realtime_kline_service.py:1713-1785`
+
+### 9.4 数据补充与校验
+
+#### K线连续性校验
+
+```python
+def check_data_continuity(
+    self,
+    klines: List[Dict],
+    timeframe: str
+) -> Tuple[bool, List[Tuple[datetime, datetime]]]:
+    """
+    检查K线数据连续性
+
+    返回:
+        (is_continuous, gaps): 是否连续，间隙列表
+    """
+    if not klines or len(klines) < 2:
+        return True, []
+
+    # 计算周期间隔
+    timeframe_delta = self._get_timeframe_delta(timeframe)
+
+    # 检查间隙
+    gaps = []
+    for i in range(len(klines) - 1):
+        current_time = klines[i]['time']
+        next_time = klines[i + 1]['time']
+        expected_time = current_time + timeframe_delta
+
+        # 允许5秒误差
+        if abs((next_time - expected_time).total_seconds()) > 5:
+            gaps.append((current_time, next_time))
+
+    is_continuous = len(gaps) == 0
+    return is_continuous, gaps
+```
+
+**校验逻辑**:
+- 计算相邻K线时间差
+- 对比预期时间间隔
+- 允许5秒误差
+
+**代码引用**: `utils/kline_data_filler.py`
+
+#### 自动数据补充
+
+```python
+def fill_missing_klines(
+    self,
+    symbol: str,
+    timeframe: str,
+    start_time: datetime,
+    end_time: datetime
+) -> List[Dict]:
+    """
+    补充缺失的K线数据（REST API）
+
+    流程:
+    1. 查询数据库现有数据
+    2. 检查连续性
+    3. 识别间隙
+    4. REST API补充缺失区间
+    5. 批量写入数据库
+    """
+    # 1. 查询现有数据
+    existing_klines = self.kline_repo.get_klines_by_timeframe(
+        symbol, timeframe, start_time, end_time
+    )
+
+    # 2. 检查连续性
+    is_continuous, gaps = self.check_data_continuity(existing_klines, timeframe)
+
+    if is_continuous:
+        logger.info(f"数据连续，无需补充")
+        return existing_klines
+
+    # 3. 补充缺失区间
+    logger.info(f"检测到{len(gaps)}个间隙，开始补充")
+
+    filled_klines = []
+    for gap_start, gap_end in gaps:
+        # REST API获取缺失K线
+        missing_klines = self._fetch_klines_from_api(
+            symbol, timeframe, gap_start, gap_end
+        )
+
+        # 批量写入数据库
+        if missing_klines:
+            self.kline_repo.batch_upsert_copy(missing_klines)
+            filled_klines.extend(missing_klines)
+            logger.info(f"补充{len(missing_klines)}条K线")
+
+    # 4. 重新查询完整数据
+    complete_klines = self.kline_repo.get_klines_by_timeframe(
+        symbol, timeframe, start_time, end_time
+    )
+
+    return complete_klines
+```
+
+**补充策略**:
+- 识别时间间隙
+- REST API获取缺失数据
+- 批量写入数据库
+- 重新校验连续性
+
+**代码引用**: `utils/kline_data_filler.py`
+
+---
+
+## 10. 部署设计
+
+### 10.1 Docker容器化
+
+#### docker-compose配置
+
+```yaml
+version: '3.8'
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: crypto_timescaledb
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: crypto_data
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./init_timescaledb.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    shm_size: 256mb
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - max_connections=100
+
+  realtime_service:
+    build:
+      context: .
+      dockerfile: Dockerfile.realtime
+    container_name: crypto_realtime_service
+    depends_on:
+      - timescaledb
+    environment:
+      POSTGRES_HOST: timescaledb
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: crypto_data
+      LARK_WEBHOOK_URL: ${LARK_WEBHOOK_URL}
+    restart: unless-stopped
+    volumes:
+      - ./realtime_kline_service.log:/app/realtime_kline_service.log
+
+volumes:
+  timescaledb_data:
+```
+
+**容器说明**:
+- timescaledb: 时序数据库服务
+- realtime_service: 实时分析服务
+
+**代码引用**: `docker-compose.yml`
+
+#### Dockerfile配置
+
+```dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# 安装系统依赖
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gcc \
+    postgresql-client && \
+    rm -rf /var/lib/apt/lists/*
+
+# 安装Python依赖
+COPY pyproject.toml uv.lock ./
+RUN pip install --no-cache-dir uv && \
+    uv pip install --system -r pyproject.toml
+
+# 复制应用代码
+COPY . .
+
+# 健康检查
+HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "import psycopg; conn = psycopg.connect('dbname=crypto_data user=postgres host=timescaledb'); conn.close()" || exit 1
+
+# 启动服务
+CMD ["python", "realtime_kline_service.py"]
+```
+
+**代码引用**: `Dockerfile.realtime`
+
+### 10.2 环境配置管理
+
+#### 环境变量
+
+```bash
+# .env文件
+# 数据库配置
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=your_secure_password
+POSTGRES_DB=crypto_data
+
+# 飞书配置
+LARK_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your_webhook_id
+
+# 服务配置
+DEFAULT_BASE_SYMBOL=BTC/USDC:USDC
+DEFAULT_TIMEFRAMES=5m,1h,4h
+ANALYSIS_WORKERS_GENERAL=15
+
+# 性能配置
+DEFAULT_BATCH_SIZE=1000
+DEFAULT_BATCH_TIMEOUT=5.0
+BETA_WINDOW=100
+ZSCORE_WINDOW=30
+
+# 监控配置
+QUEUE_MONITOR_INTERVAL=60
+QUEUE_WARNING_THRESHOLD=0.8
+```
+
+**代码引用**: `.env.example`
+
+#### 配置加载
+
+```python
+import os
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
+
+# 数据库配置
+POSTGRES_HOST = os.getenv('POSTGRES_HOST', 'localhost')
+POSTGRES_PORT = int(os.getenv('POSTGRES_PORT', 5432))
+POSTGRES_USER = os.getenv('POSTGRES_USER', 'postgres')
+POSTGRES_PASSWORD = os.getenv('POSTGRES_PASSWORD')
+POSTGRES_DB = os.getenv('POSTGRES_DB', 'crypto_data')
+
+# 飞书配置
+LARK_WEBHOOK_URL = os.getenv('LARK_WEBHOOK_URL')
+
+# 服务配置
+DEFAULT_BASE_SYMBOL = os.getenv('DEFAULT_BASE_SYMBOL', 'BTC/USDC:USDC')
+DEFAULT_TIMEFRAMES = os.getenv('DEFAULT_TIMEFRAMES', '5m,1h,4h').split(',')
+ANALYSIS_WORKERS_GENERAL = int(os.getenv('ANALYSIS_WORKERS_GENERAL', 15))
+```
+
+**代码引用**: `utils/config.py`
+
+### 10.3 资源限制策略
+
+#### Docker资源限制
+
+```yaml
+services:
+  realtime_service:
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'       # 最大2核
+          memory: 1G        # 最大1GB内存
+        reservations:
+          cpus: '0.5'       # 保留0.5核
+          memory: 512M      # 保留512MB内存
+```
+
+**代码引用**: `docker-compose.yml`
+
+#### 应用层资源限制
+
+```python
+# 队列大小限制
+QUEUE_CONFIG_GENERAL = {
+    'kline_buffer_size': 10000,
+    'analysis_queue_size': 15000,
+    'analysis_result_buffer_size': 10000
+}
+
+# 数据库连接池限制
+POOL_MIN_SIZE = 2
+POOL_MAX_SIZE = 10
+
+# 工作线程数限制
+ANALYSIS_WORKERS_GENERAL = 15
+
+# 查询结果限制
+DB_QUERY_LIMIT = 10000
+```
+
+**代码引用**: `utils/config.py`
+
+### 10.4 运维方案
+
+#### 启动服务
+
+```bash
+# 1. 启动数据库
+docker-compose up -d timescaledb
+
+# 2. 等待数据库就绪
+docker-compose logs -f timescaledb | grep "database system is ready"
+
+# 3. 启动实时服务
+docker-compose up -d realtime_service
+
+# 4. 查看日志
+docker-compose logs -f realtime_service
+```
+
+#### 停止服务
+
+```bash
+# 1. 停止实时服务（优雅关闭）
+docker-compose stop realtime_service
+
+# 2. 停止数据库
+docker-compose stop timescaledb
+
+# 3. 停止所有服务
+docker-compose down
+```
+
+#### 日志管理
+
+```bash
+# 查看实时日志
+docker-compose logs -f realtime_service
+
+# 查看最近100行日志
+docker-compose logs --tail=100 realtime_service
+
+# 导出日志到文件
+docker-compose logs --no-color realtime_service > service.log
+```
+
+#### 备份与恢复
+
+```bash
+# 数据库备份
+docker exec crypto_timescaledb pg_dump -U postgres crypto_data > backup.sql
+
+# 数据库恢复
+docker exec -i crypto_timescaledb psql -U postgres crypto_data < backup.sql
+
+# 数据卷备份
+docker run --rm -v timescaledb_data:/data -v $(pwd):/backup ubuntu tar czf /backup/timescaledb_backup.tar.gz /data
+```
+
+---
+
+## 11. 配置管理
+
+### 11.1 核心配置参数
+
+#### 服务配置
+
+```python
+# 基准币种（用于配对分析）
+DEFAULT_BASE_SYMBOL = 'BTC/USDC:USDC'
+
+# 订阅周期列表
+DEFAULT_TIMEFRAMES = ['5m', '1h', '4h']
+
+# 批量写入配置
+DEFAULT_BATCH_SIZE = 1000        # K线批量写入大小
+DEFAULT_BATCH_TIMEOUT = 5.0      # K线批量写入超时（秒）
+
+# 分析结果批量写入配置
+ANALYSIS_RESULT_BATCH_SIZE = 100
+ANALYSIS_RESULT_BATCH_TIMEOUT = 2.0
+ANALYSIS_USE_COPY_METHOD = True  # 使用COPY命令
+```
+
+**代码引用**: `utils/config.py:DEFAULT_BASE_SYMBOL`, `utils/config.py:DEFAULT_TIMEFRAMES`
+
+#### 数据窗口配置
+
+```python
+# 数据窗口配置（天数）
+DATA_WINDOW_CONFIG = {
+    '5m': 7,    # 5分钟周期: 7天
+    '1h': 30,   # 1小时周期: 30天
+    '4h': 60    # 4小时周期: 60天
+}
+
+# 最小数据点要求
+MIN_DATA_POINTS = {
+    '5m': 100,   # 5m周期最小100个点
+    '1h': 100,   # 1h周期最小100个点
+    '4h': 358    # 4h周期最小358个点（60天）
+}
+
+MIN_4H_DATA_POINTS = 358  # 新币种4H数据点阈值
+```
+
+**代码引用**: `utils/config.py:DATA_WINDOW_CONFIG`, `utils/config.py:MIN_DATA_POINTS`
+
+#### 分析参数配置
+
+```python
+# 相关性阈值
+TARGET_CORR_THRESHOLD = 0.7      # 相关系数阈值（前置过滤）
+CORRELATION_METHOD = 'pearson'    # 相关系数方法
+
+# OLS协整参数
+BETA_WINDOW = 100                 # OLS回归窗口（期数）
+ZSCORE_WINDOW = 30                # Z-score计算窗口（期数）
+COINTEGRATION_THRESHOLD = 0.05    # ADF检验p值阈值
+
+# Z-score阈值（不同周期）
+ZSCORE_THRESHOLDS = {
+    '5m': 1.8,   # 5m周期: 高敏感度
+    '1h': 1.5,   # 1h周期: 中等敏感度
+    '4h': 0.2    # 4h周期: 低敏感度（方向确认）
+}
+
+# 多周期验证要求
+REQUIRED_PERIODS = 2  # 最少需要2个周期协整通过
+
+# α显著性判定
+ALPHA_SIGNIFICANCE_LEVEL = 0.05   # α的p值阈值
+ALPHA_CROSS_ASSET_THRESHOLD = 5.0 # 跨资产类阈值
+ALPHA_SAME_ASSET_THRESHOLD = 2.0  # 同类资产阈值
+```
+
+**代码引用**: `utils/config.py:TARGET_CORR_THRESHOLD`, `utils/config.py:BETA_WINDOW`, `utils/config.py:ZSCORE_THRESHOLDS`
+
+### 11.2 性能调优参数
+
+#### 队列配置
+
+```python
+QUEUE_CONFIG_GENERAL = {
+    'kline_buffer_size': 10000,          # K线缓冲队列大小
+    'analysis_queue_size': 15000,        # 分析任务队列大小
+    'analysis_result_buffer_size': 10000 # 分析结果队列大小
+}
+
+# 队列监控配置
+QUEUE_MONITOR_INTERVAL = 60     # 监控间隔（秒）
+QUEUE_WARNING_THRESHOLD = 0.8   # 告警阈值（80%）
+QUEUE_GET_TIMEOUT = 1.0         # 队列获取超时（秒）
+```
+
+**代码引用**: `utils/config.py:QUEUE_CONFIG_GENERAL`
+
+#### 工作线程配置
+
+```python
+# 分析工作线程数
+ANALYSIS_WORKERS_GENERAL = 15
+
+# 线程关闭超时
+WORKER_THREAD_SHUTDOWN_TIMEOUT = 30    # 工作线程关闭超时（秒）
+MAIN_THREAD_SHUTDOWN_TIMEOUT = 60      # 主线程关闭超时（秒）
+```
+
+**代码引用**: `utils/config.py:ANALYSIS_WORKERS_GENERAL`
+
+#### 去重配置
+
+```python
+# 入队去重窗口（秒）
+ENQUEUE_DEDUP_WINDOWS = {
+    '5m': 30,    # 5m周期: 30秒
+    '1h': 180,   # 1h周期: 180秒
+    '4h': 600    # 4h周期: 600秒
+}
+
+# 分析去重窗口（秒）
+DEDUP_WINDOWS = {
+    '5m': 60,    # 5m周期: 60秒
+    '1h': 300,   # 1h周期: 300秒
+    '4h': 900    # 4h周期: 900秒
+}
+
+# 去重字典清理配置
+CLEANUP_INTERVAL = 300       # 清理间隔（秒）
+MAX_RECENT_TASKS = 5000      # 最大缓存任务数
+```
+
+**代码引用**: `utils/config.py:ENQUEUE_DEDUP_WINDOWS`, `utils/config.py:DEDUP_WINDOWS`
+
+#### 数据库配置
+
+```python
+# 连接池配置
+POOL_MIN_SIZE = 2            # 最小连接数
+POOL_MAX_SIZE = 10           # 最大连接数
+POOL_TIMEOUT = 30            # 获取连接超时（秒）
+POOL_MAX_LIFETIME = 3600     # 连接最大存活时间（秒）
+POOL_MAX_IDLE = 600          # 最大空闲时间（秒）
+
+# 查询限制
+DB_QUERY_LIMIT = 10000       # 单次查询最大返回条数
+```
+
+**代码引用**: `utils/config.py:POOL_MIN_SIZE`, `utils/config.py:DB_QUERY_LIMIT`
+
+### 11.3 WebSocket配置
+
+```python
+# 连接配置
+WS_URL = 'wss://api.hyperliquid.xyz/ws'
+WS_TIMEOUT = 30              # 连接超时（秒）
+WS_MAX_RETRIES = 30          # 最大重试次数
+WS_ALERT_THRESHOLD = 5       # 告警阈值（第N次失败）
+
+# Ping配置
+WS_PING_INTERVAL_MS = 5000   # Ping间隔（毫秒）
+WS_PING_THREAD_SHUTDOWN_TIMEOUT = 2.0  # Ping线程关闭超时（秒）
+
+# 健康监控配置
+WS_HEALTH_MONITOR_TIMEOUT = 15          # 假活检测超时（秒）
+WS_HEALTH_MONITOR_WARNING_THRESHOLD = 10 # 警告阈值（秒）
+WS_HEALTH_CHECK_INTERVAL = 2            # 健康检查间隔（秒）
+WS_HEALTH_REPORT_INTERVAL = 60          # 健康报告间隔（秒）
+
+# 重连配置
+WS_RECONNECT_MIN_DELAY = 1.0            # 最小重连延迟（秒）
+WS_RECONNECT_INITIAL_DELAY = 1.0        # 初始重连延迟（秒）
+WS_RECONNECT_MAX_DELAY = 60.0           # 最大重连延迟（秒）
+WS_RECONNECT_MULTIPLIER = 2.0           # 延迟递增因子
+WS_RECONNECT_JITTER = 0.25              # 随机抖动比例（±25%）
+
+# 状态管理
+WS_STATE_VALIDATION_DELAY = 0.1         # 状态验证延迟（秒）
+WS_READY_TIMEOUT = 30                   # 就绪超时（秒）
+WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
+```
+
+**代码引用**: `utils/config.py:WS_URL`, `utils/config.py:WS_PING_INTERVAL_MS`
+
+---
+
+## 12. 附录
+
+### 12.1 关键设计决策
+
+#### 1. 直接订阅原生K线 vs 本地聚合
+
+**决策**: 直接订阅交易所原生 5m/1h/4h K线
+
+**理由**:
+- ✅ 精度与REST API一致
+- ✅ 无本地聚合误差
+- ✅ Volume数据完全一致
+- ✅ 额外开销 <2%
+- ✅ 代码简洁，维护成本低
+
+**权衡**:
+- ❌ 订阅数增加 (N个币种 × 3周期)
+- ✅ 1h/4h推送频率极低，实际影响可忽略
+
+**代码引用**: `realtime_kline_service.py:22-26`
+
+#### 2. Old方法 vs New方法协整检验
+
+**决策**: 同时使用Old全量OLS和New双窗口OLS，多周期验证
+
+**理由**:
+- Old方法: 全量数据，事后验证可靠
+- New方法: 双窗口OLS，实时交易可用，避免look-ahead bias
+- 多周期验证: 6个结果互相印证，减少虚假信号
+
+**权衡**:
+- ❌ 计算量增加 (6次协整检验)
+- ✅ 信号质量显著提升
+
+**代码引用**: `utils/analysis_core.py:185-407`, `utils/config.py:REQUIRED_PERIODS`
+
+#### 3. COPY批量写入 vs executemany
+
+**决策**: 使用COPY命令批量写入
+
+**理由**:
+- ✅ 性能提升100倍 (>40K条/秒)
+- ✅ 支持临时表策略，ON COMMIT DROP自动清理
+- ✅ 批量排序减少死锁
+
+**权衡**:
+- ❌ 代码复杂度略高
+- ✅ 性能提升远超复杂度成本
+
+**代码引用**: `timescaledb.py:342-450`
+
+#### 4. 多线程 vs 异步IO
+
+**决策**: 使用多线程 (threading)
+
+**理由**:
+- ✅ psycopg 3.x同步API性能足够 (COPY >40K条/秒)
+- ✅ statsmodels同步阻塞计算，异步无优势
+- ✅ 线程模型简单清晰，易于调试
+- ✅ 并发分析任务完全独立，线程池模式适合
+
+**权衡**:
+- ❌ 线程上下文切换开销
+- ✅ 15线程规模可接受，避免asyncio生态碎片化
+
+**代码引用**: `realtime_kline_service.py:224-275`
+
+### 12.2 技术权衡分析
+
+#### 性能 vs 可靠性
+
+| 场景 | 性能优先 | 可靠性优先 | 采用方案 |
+|------|---------|-----------|---------|
+| 批量写入 | executemany | COPY + 死锁重试 | **可靠性优先** |
+| WebSocket连接 | 简单重连 | 指数退避 + 假活检测 | **可靠性优先** |
+| 协整检验 | Old方法 | Old + New多周期验证 | **可靠性优先** |
+| 去重机制 | 无去重 | 双重去重 (入队 + 分析) | **可靠性优先** |
+
+**设计原则**: 在保证性能目标的前提下，优先保证可靠性
+
+#### 复杂度 vs 精度
+
+| 场景 | 简单方案 | 精确方案 | 采用方案 |
+|------|---------|---------|---------|
+| K线获取 | 本地聚合 | 直接订阅原生K线 | **简单方案** (精度一致) |
+| 协整检验 | 单一方法 | Old + New双方法 | **精确方案** |
+| Z-score计算 | 简单移动平均 | 避免样本偏差 | **精确方案** |
+| 健康监控 | 单一指标 | 双重健康检测 | **精确方案** |
+
+**设计原则**: 核心算法优先精度，辅助功能优先简单
+
+### 12.3 未来优化方向
+
+#### 短期优化 (1-3个月)
+
+1. **协整健康监控优化**
+   - 增加更多健康指标 (半衰期、均值回归速度)
+   - 优化评分权重
+   - 实时健康度曲线
+
+2. **告警过滤优化**
+   - 增加信号强度过滤 (仅发送HIGH信号)
+   - 增加流动性过滤 (过滤低流动性币种)
+   - 增加波动率过滤 (过滤高波动币种)
+
+3. **性能优化**
+   - 优化数据库查询 (增加更多索引)
+   - 优化批量写入 (动态批量大小)
+   - 优化分析线程数 (自适应线程池)
+
+**代码引用**: `utils/coingetation_more_check.py`
+
+#### 中期优化 (3-6个月)
+
+1. **机器学习增强**
+   - 协整关系强度预测
+   - 信号质量评分模型
+   - 异常检测模型 (LSTM/Transformer)
+
+2. **多策略支持**
+   - 支持Johansen协整检验
+   - 支持距离协整 (Distance Cointegration)
+   - 支持统计套利其他策略
+
+3. **实时回测**
+   - 实时策略回测引擎
+   - 实时绩效监控
+   - 实时风险管理
+
+**代码引用**: `Johansen检验详解.md`
+
+#### 长期优化 (6-12个月)
+
+1. **分布式架构**
+   - 支持多节点部署
+   - 支持负载均衡
+   - 支持水平扩展
+
+2. **自动交易执行**
+   - 集成交易执行引擎
+   - 支持订单管理
+   - 支持风险控制
+
+3. **Web控制台**
+   - 实时监控面板
+   - 策略配置管理
+   - 历史数据查询
+
+---
+
+## 结语
+
+本设计文档详细描述了 **hyperliquid-pair-hype-purr-analyze** 项目的技术架构、核心算法、并发设计、性能优化、可靠性保证和部署方案。
+
+**文档覆盖内容**:
+- ✅ 系统架构设计 (整体架构图、组件关系、数据流)
+- ✅ 数据库设计 (表结构、索引策略、分区策略、连接池)
+- ✅ 网络层设计 (WebSocket管理、双重健康检测、重连策略)
+- ✅ 分析引擎设计 (相关性分析、协整检验、Z-score计算、多周期验证)
+- ✅ 并发架构设计 (线程模型、队列设计、去重机制、锁策略)
+- ✅ 性能优化设计 (批量写入、缓存策略、查询优化、内存管理)
+- ✅ 可靠性设计 (错误处理、重试策略、死锁防护、降级策略)
+- ✅ 监控与告警 (实时监控、飞书告警、系统告警、数据补充)
+- ✅ 部署设计 (Docker容器化、环境配置、资源限制、运维方案)
+- ✅ 配置管理 (核心配置、性能调优、WebSocket配置)
+- ✅ 附录 (关键设计决策、技术权衡分析、未来优化方向)
+
+**设计亮点**:
+1. 直接订阅原生K线 (精度 + 简洁性)
+2. 双窗口OLS协整分析 (稳定性 + 灵敏度)
+3. 多线程异步批量写入 (性能提升100倍)
+4. 双重健康检测 (底层 + 应用层)
+5. 智能重连策略 (指数退避 + 随机抖动)
+
+**性能指标**:
+- 分析延迟: <5秒
+- 告警延迟: <10秒
+- 批量写入: >40K条/秒
+- 内存占用: <512MB
+- CPU占用: <50%
+
+感谢阅读！如有疑问或建议，欢迎反馈。
+
+---
+
+**文档版本**: v1.0
+**生成日期**: 2026-01-31
+**作者**: Claude Code
+**项目仓库**: hyperliquid-pair-hype-purr-analyze
+
