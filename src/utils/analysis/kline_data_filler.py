@@ -23,9 +23,9 @@ from datetime import datetime, timedelta, timezone
 import ccxt
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from utils.timescaledb import KlineRepository, TimescaleDBClient
-from utils.logging_config import logger
-from utils.config import (
+from src.utils.database.timescaledb import KlineRepository, TimescaleDBClient
+from src.utils.core.logging_config import logger
+from src.utils.core.config import (
     KLINE_FILLER_COOLDOWN_SECONDS,
     KLINE_FILLER_API_INTERVAL,
     KLINE_FILLER_MAX_RETRIES,

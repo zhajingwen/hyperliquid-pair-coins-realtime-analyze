@@ -22,8 +22,8 @@ from enum import Enum
 from typing import Dict, List, Optional, Callable
 from datetime import datetime, timezone
 
-from utils.logging_config import logger
-from utils.config import (
+from src.utils.core.logging_config import logger
+from src.utils.core.config import (
     WS_PING_INTERVAL_MS, WS_PING_THREAD_SHUTDOWN_TIMEOUT,
     WS_STATE_VALIDATION_DELAY, WS_READY_TIMEOUT,
     WS_RECONNECT_MIN_DELAY, WS_RECONNECT_INITIAL_DELAY,

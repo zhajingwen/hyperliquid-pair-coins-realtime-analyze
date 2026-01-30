@@ -27,8 +27,8 @@ from psycopg import Connection, Cursor
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from utils.logging_config import logger
-from utils.config import (
+from src.utils.core.logging_config import logger
+from src.utils.core.config import (
     TIMESCALEDB_HOST,
     TIMESCALEDB_PORT,
     TIMESCALEDB_NAME,

@@ -4,7 +4,7 @@ import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
 import nolds
 
-from utils.config import (
+from src.utils.core.config import (
     HEALTH_MONITOR_LONG_WINDOW,
     HEALTH_MONITOR_MAX_HALFLIFE,
     HEALTH_MONITOR_MIN_HALFLIFE,

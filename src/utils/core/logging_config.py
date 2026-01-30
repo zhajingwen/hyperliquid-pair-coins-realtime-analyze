@@ -12,11 +12,11 @@
 
 使用方法：
     # 方式1：直接使用全局 logger（推荐）
-    from utils.logging_config import logger
+    from src.utils.core.logging_config import logger
     logger.info("这是一条日志")
     
     # 方式2：获取自定义名称的 logger
-    from utils.logging_config import get_logger
+    from src.utils.core.logging_config import get_logger
     logger = get_logger(__name__)
     logger.info("这是一条日志")
 
@@ -142,6 +142,6 @@ def get_logger(name: str) -> logging.Logger:
     
     Note:
         大多数情况下直接使用全局 logger 即可：
-        from utils.logging_config import logger
+        from src.utils.core.logging_config import logger
     """
     return logging.getLogger(name)

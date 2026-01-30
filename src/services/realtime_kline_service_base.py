@@ -30,17 +30,17 @@ from cachetools import TTLCache
 
 import psycopg.errors
 
-from utils.enhanced_ws_manager import EnhancedWebSocketManager, ConnectionState
-from utils.timescaledb import (
+from src.utils.websocket.enhanced_ws_manager import EnhancedWebSocketManager, ConnectionState
+from src.utils.database.timescaledb import (
     TimescaleDBClient,
     KlineRepository,
     SymbolMetadataRepository,
     AnalysisResultRepository
 )
-from utils.analysis_core import analyze_multi_period, prepare_price_series, calculate_correlation
-from utils.lark_bot import sender_colourful
-from utils.alert_formatter import AlertFormatter
-from utils.config import (
+from src.utils.analysis.analysis_core import analyze_multi_period, prepare_price_series, calculate_correlation
+from src.utils.monitoring.lark_bot import sender_colourful
+from src.utils.monitoring.alert_formatter import AlertFormatter
+from src.utils.core.config import (
     # 服务配置
     DEFAULT_TIMEFRAMES,
     DEFAULT_BATCH_SIZE,
@@ -137,7 +137,7 @@ class RealtimeKlineServiceBase(ABC):
         self.data_filler = self._config.data_filler_class(kline_repo=self.kline_repo)
 
         # 6. 飞书告警配置（从配置导入）
-        from utils.config import lark_webhook_url
+        from src.utils.core.config import lark_webhook_url
         self.lark_webhook_url = lark_webhook_url
 
         if not self.lark_webhook_url:
@@ -312,10 +312,10 @@ class RealtimeKlineServiceBase(ABC):
             logger 实例
         """
         if logger_module == 'get_logger':
-            from utils.logging_config import get_logger
+            from src.utils.core.logging_config import get_logger
             return get_logger(__name__)
         else:
-            from utils.logging_config import logger
+            from src.utils.core.logging_config import logger
             return logger
 
     def _build_subscriptions(self) -> List[Dict]:

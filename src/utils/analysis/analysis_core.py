@@ -21,9 +21,9 @@ from typing import List, Dict, Tuple, Optional
 from statsmodels.tsa.stattools import coint, adfuller
 import statsmodels.api as sm
 
-from utils.logging_config import logger
-from utils.config import CORRELATION_METHOD, ADF_LAG_SELECTION_METHOD
-from utils.config import (
+from src.utils.core.logging_config import logger
+from src.utils.core.config import CORRELATION_METHOD, ADF_LAG_SELECTION_METHOD
+from src.utils.core.config import (
     MIN_POINTS_FOR_CORRELATION,
     MIN_POINTS_FOR_ZSCORE,
     MIN_POINTS_FOR_OLS,
@@ -654,7 +654,7 @@ def analyze_pair_advanced(
             timeframe, window_str = stats_period_key
             if timeframe == HEALTH_MONITOR_PERIOD[0] and window_str == HEALTH_MONITOR_PERIOD[1]:
                 try:
-                    from utils.coingetation_more_check import CointegrationHealthMonitor
+                    from src.utils.analysis.coingetation_more_check import CointegrationHealthMonitor
 
                     base_prices = prepare_price_series(base_klines)
                     alt_prices = prepare_price_series(alt_klines)

@@ -39,9 +39,9 @@ from typing import List
 from hyperliquid.info import Info
 import hyperliquid.utils.constants as constants
 
-from realtime_kline_service_base import RealtimeKlineServiceBase, ServiceConfig
-from utils.kline_data_filler import KlineDataFiller
-from utils.config import (
+from src.services.realtime_kline_service_base import RealtimeKlineServiceBase, ServiceConfig
+from src.utils.analysis.kline_data_filler import KlineDataFiller
+from src.utils.core.config import (
     # 服务配置
     DEFAULT_BASE_SYMBOL,
     # 队列配置

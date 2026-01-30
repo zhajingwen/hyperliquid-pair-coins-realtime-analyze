@@ -44,8 +44,8 @@ except ImportError:
         def update(self, n=1):
             pass
 
-from utils.timescaledb import TimescaleDBClient
-from utils.logging_config import logger
+from src.utils.database.timescaledb import TimescaleDBClient
+from src.utils.core.logging_config import logger
 
 
 # 终端颜色工具类

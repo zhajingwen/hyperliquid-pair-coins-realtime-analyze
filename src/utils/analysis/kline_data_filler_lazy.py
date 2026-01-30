@@ -18,9 +18,9 @@ from datetime import datetime
 
 import ccxt
 
-from utils.kline_data_filler import KlineDataFiller
-from utils.logging_config import logger
-from utils.config import KLINE_FILLER_LAZY_RATE_LIMIT, KLINE_FILLER_LAZY_TIMEOUT_MS
+from src.utils.analysis.kline_data_filler import KlineDataFiller
+from src.utils.core.logging_config import logger
+from src.utils.core.config import KLINE_FILLER_LAZY_RATE_LIMIT, KLINE_FILLER_LAZY_TIMEOUT_MS
 
 
 class KlineDataFillerLazy(KlineDataFiller):

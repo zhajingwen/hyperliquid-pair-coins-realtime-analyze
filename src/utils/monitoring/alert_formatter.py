@@ -13,8 +13,8 @@
 
 from datetime import datetime, timezone
 from typing import Dict, Optional, List, Tuple
-from utils.logging_config import logger
-from utils.config import (
+from src.utils.core.logging_config import logger
+from src.utils.core.config import (
     ZSCORE_THRESHOLDS,
     HEALTH_MONITOR_LONG_WINDOW,
     HEALTH_MONITOR_SHORT_WINDOW,

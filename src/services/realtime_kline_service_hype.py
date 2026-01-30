@@ -37,9 +37,9 @@ Date: 2026-01-19
 
 from typing import List
 
-from realtime_kline_service_base import RealtimeKlineServiceBase, ServiceConfig
-from utils.kline_data_filler_lazy import KlineDataFillerLazy
-from utils.config import (
+from src.services.realtime_kline_service_base import RealtimeKlineServiceBase, ServiceConfig
+from src.utils.analysis.kline_data_filler_lazy import KlineDataFillerLazy
+from src.utils.core.config import (
     # HYPE 专用配置
     HYPE_BASE_SYMBOL,
     HYPE_SYMBOLS,

@@ -2,8 +2,8 @@ import requests
 import json
 import time
 
-from utils.config import lark_webhook_url, lark_alert_email, LARK_MAX_RETRIES, LARK_REQUEST_TIMEOUT, LARK_BACKOFF_BASE
-from utils.logging_config import logger
+from src.utils.core.config import lark_webhook_url, lark_alert_email, LARK_MAX_RETRIES, LARK_REQUEST_TIMEOUT, LARK_BACKOFF_BASE
+from src.utils.core.logging_config import logger
 
 def sender(msg, url=None, title='', del_blank_row=True):
     """

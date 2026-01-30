@@ -4,7 +4,6 @@ __pycache__/
 .claude/
 CLAUDE.md
 .env
-.env.example
 .venv/
 .vscode/
 .DS_Store

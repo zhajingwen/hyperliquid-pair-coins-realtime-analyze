@@ -1,7 +1,7 @@
 import traceback
 import os
-from utils.lark_bot import sender
-from utils.config import lark_webhook_url
+from src.utils.monitoring.lark_bot import sender
+from src.utils.core.config import lark_webhook_url
 # from config import env
 
 def ErrorMonitor(spider_name, user=None):
@@ -22,7 +22,7 @@ def ErrorMonitor(spider_name, user=None):
                 return func(*args, **kwargs)
             # 捕获异常，发送告警
             except Exception as e:
-                from utils.redisdb import redis_cli
+                from src.utils.database.redisdb import redis_cli
                 redis_c = redis_cli()   
                 err_info = traceback.format_exc()
                 print(err_info)

@@ -1,8 +1,8 @@
 import time
 from datetime import datetime, timedelta
 
-from utils.config import env, SCHEDULER_WEEKDAY_CHECK_INTERVAL, SCHEDULER_TIME_CHECK_INTERVAL, SCHEDULER_EXECUTION_WINDOW_MINUTES, SCHEDULER_POST_EXECUTION_WAIT_SECONDS
-from utils.logging_config import logger
+from src.utils.core.config import env, SCHEDULER_WEEKDAY_CHECK_INTERVAL, SCHEDULER_TIME_CHECK_INTERVAL, SCHEDULER_EXECUTION_WINDOW_MINUTES, SCHEDULER_POST_EXECUTION_WAIT_SECONDS
+from src.utils.core.logging_config import logger
 
 def scheduled_task(start_time=None, duration=None, weekdays=None):
     """
