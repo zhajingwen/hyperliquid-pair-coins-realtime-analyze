@@ -97,7 +97,7 @@ class RealtimeKlineServiceHypePurr(RealtimeKlineServiceBase):
             queue_config=QUEUE_CONFIG_HYPE,
             analysis_workers=ANALYSIS_WORKERS_HYPE,
             data_filler_class=KlineDataFillerLazy,
-            logger_module='get_logger'  # 使用 from utils.logging_config import get_logger
+            logger_module='logger'  # 使用 from utils.logging_config import logger
         )
 
     def _get_active_symbols(self) -> List[str]:
