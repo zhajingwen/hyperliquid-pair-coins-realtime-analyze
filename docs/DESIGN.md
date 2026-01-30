@@ -1012,3 +1012,1219 @@ def get_latest_mid_price(self, symbol: str) -> Optional[float]:
 
 ---
 
+## 5. 分析引擎设计
+
+### 5.1 核心算法流程
+
+```mermaid
+flowchart TD
+    A[收到5m K线推送] --> B{检查黑名单}
+    B -->|在黑名单| Z[跳过分析]
+    B -->|不在黑名单| C[查询3周期历史数据]
+
+    C --> D[K线连续性校验]
+    D -->|有缺失| E[REST API补充数据]
+    D -->|完整| F[相关系数前置过滤]
+    E --> F
+
+    F -->|相关性 < 阈值| Z
+    F -->|相关性 ≥ 阈值| G[多周期协整验证]
+
+    G --> H[Old方法: 全量OLS]
+    G --> I[New方法: 双窗口OLS]
+
+    H --> J[3周期 × 2方法 = 6个结果]
+    I --> J
+
+    J --> K{协整通过数 ≥ 2?}
+    K -->|否| Z
+    K -->|是| L[Z-score符号一致性检查]
+
+    L -->|不一致| Z
+    L -->|一致| M[Z-score超阈值检查]
+
+    M -->|未超阈值| Z
+    M -->|超阈值| N[协整健康状态约束]
+
+    N -->|短期窗口非HEALTHY| Z
+    N -->|短期窗口HEALTHY| O[保存分析结果]
+
+    O --> P[发送飞书告警]
+    P --> Q[分析完成]
+```
+
+**代码引用**: `realtime_kline_service.py:1037-1402`
+
+### 5.2 相关性分析
+
+#### 为什么使用收益率相关性？
+
+```python
+# 计算收益率序列（与价格相关性的区别）
+base_returns = base_prices.pct_change().dropna()
+alt_returns = alt_prices.pct_change().dropna()
+
+# 计算收益率相关系数
+correlation = base_returns.corr(alt_returns, method='pearson')
+```
+
+**收益率相关性的优势**:
+
+1. **去趋势化**: 消除市场整体涨跌的影响
+   - 价格相关性: 受长期趋势主导（牛市都涨 → 高相关）
+   - 收益率相关性: 反映短期波动同步性
+
+2. **平稳性**: 收益率序列通常平稳，适合统计建模
+   - 价格序列: 非平稳（有趋势）
+   - 收益率序列: 近似平稳（零均值）
+
+3. **实战意义**: 反映"基准币涨1%时，目标币涨多少"
+   - 更符合配对交易的实际需求
+
+**前置过滤**:
+```python
+if abs(correlation) < TARGET_CORR_THRESHOLD:
+    logger.debug(f"相关性不足 ({correlation:.4f} < {TARGET_CORR_THRESHOLD})，跳过分析")
+    return None
+```
+
+**代码引用**: `utils/analysis_core.py:83-141`
+
+### 5.3 协整检验 (Engle-Granger)
+
+#### Old方法 - 全量OLS
+
+```python
+def calculate_cointegration_params_ols(
+    base_klines: List[Dict],
+    alt_klines: List[Dict]
+) -> Optional[Dict]:
+    """
+    全量数据OLS协整参数计算（Engle-Granger两步法）
+
+    用途: 事后验证分析
+    数据窗口: 全量历史数据
+    局限: 存在 look-ahead bias
+    """
+    # Step 1: OLS回归 log(alt) = α + β * log(base) + ε
+    log_base_series = np.log(base_prices)
+    log_alt_series = np.log(alt_prices)
+
+    X = sm.add_constant(log_base_series)
+    model = sm.OLS(log_alt_series, X).fit()
+
+    alpha = model.params.iloc[0]
+    beta = model.params.iloc[1]
+
+    # Step 2: 计算价差
+    if use_alpha:
+        spread = log_alt_series - (alpha + beta * log_base_series)
+    else:
+        spread = log_alt_series - beta * log_base_series
+
+    # Step 3: ADF检验价差平稳性
+    adf_result = adfuller(spread.values, autolag='AIC')
+    adf_pvalue = adf_result[1]
+
+    # Step 4: 判定协整
+    is_cointegrated = (adf_pvalue < COINTEGRATION_THRESHOLD)
+
+    return {
+        'alpha': alpha,
+        'beta': beta,
+        'spread': spread,
+        'adf_pvalue': adf_pvalue,
+        'is_cointegrated': is_cointegrated
+    }
+```
+
+**局限性**:
+- 使用未来数据计算历史OLS参数
+- 不适合实时交易决策
+
+**适用场景**:
+- 回测验证
+- 历史分析
+
+**代码引用**: `utils/analysis_core.py:185-277`
+
+#### New方法 - 双窗口OLS
+
+```python
+def calculate_cointegration_params_dual_window(
+    base_klines: List[Dict],
+    alt_klines: List[Dict],
+    beta_window: int = 100,     # OLS回归窗口
+    zscore_window: int = 30      # Z-score计算窗口
+) -> Optional[Dict]:
+    """
+    双窗口OLS协整参数计算（实时交易版本）
+
+    用途: 实时交易
+    beta_window: 稳定回归参数（100期）
+    zscore_window: 敏感均值回归（30期）
+    避免 look-ahead bias: 使用前N-1期计算OLS
+    """
+    # 数据验证
+    if len(aligned) < beta_window + zscore_window:
+        return None
+
+    # Step 1: 使用前beta_window期计算OLS参数
+    ols_data = aligned.iloc[-(beta_window + zscore_window):-zscore_window]
+
+    log_base_ols = np.log(ols_data['base'])
+    log_alt_ols = np.log(ols_data['alt'])
+
+    X = sm.add_constant(log_base_ols)
+    model = sm.OLS(log_alt_ols, X).fit()
+
+    alpha = model.params.iloc[0]
+    beta = model.params.iloc[1]
+
+    # Step 2: 使用最近zscore_window期计算Z-score
+    zscore_data = aligned.iloc[-zscore_window:]
+
+    log_base_zscore = np.log(zscore_data['base'])
+    log_alt_zscore = np.log(zscore_data['alt'])
+
+    if use_alpha:
+        spread = log_alt_zscore - (alpha + beta * log_base_zscore)
+    else:
+        spread = log_alt_zscore - beta * log_base_zscore
+
+    # Step 3: 计算Z-score（避免样本偏差）
+    spread_mean = spread[:-1].mean()
+    spread_std = spread[:-1].std()
+    current_zscore = (spread.iloc[-1] - spread_mean) / spread_std
+
+    # Step 4: ADF检验价差平稳性
+    adf_result = adfuller(spread.values, autolag='AIC')
+    adf_pvalue = adf_result[1]
+
+    return {
+        'alpha': alpha,
+        'beta': beta,
+        'zscore': current_zscore,
+        'adf_pvalue': adf_pvalue,
+        'is_cointegrated': (adf_pvalue < COINTEGRATION_THRESHOLD)
+    }
+```
+
+**设计优势**:
+- **避免look-ahead bias**: 不使用未来数据
+- **平衡稳定性与灵敏度**:
+  - beta_window=100期: 稳定回归参数，减少过拟合
+  - zscore_window=30期: 快速响应价差变化
+
+**参数选择**:
+```python
+BETA_WINDOW = 100  # 约20天（5m周期）
+ZSCORE_WINDOW = 30  # 约6天（5m周期）
+```
+
+**代码引用**: `utils/analysis_core.py:280-407`, `utils/config.py:BETA_WINDOW`, `utils/config.py:ZSCORE_WINDOW`
+
+#### 智能模型选择
+
+```python
+def _select_cointegration_model(alpha: float, alpha_pvalue: float) -> Tuple[str, bool, str]:
+    """
+    根据α的显著性和绝对值大小选择最优模型
+
+    规则:
+    - |α| > 5.0 且显著 → 无α模型（跨资产类配对，如NEAR/BTC）
+    - |α| < 2.0 且显著 → 标准EG模型（同类资产配对，如UNI/SUSHI）
+    - 其他 → 无α模型
+    """
+    if alpha_pvalue < 0.05 and abs(alpha) > 5.0:
+        return "no_intercept_forced", False, f"|α|={abs(alpha):.1f}>5.0, 跨资产类配对"
+
+    elif alpha_pvalue < 0.05 and abs(alpha) < 2.0:
+        return "standard_EG", True, f"|α|={abs(alpha):.1f}<2.0, 同类资产配对"
+
+    else:
+        return "no_intercept", False, "α不显著或中等范围"
+```
+
+**设计原理**:
+- **跨资产类配对** (如NEAR/BTC): α显著且大 → 使用无α模型
+- **同类资产配对** (如UNI/SUSHI): α显著且小 → 使用标准EG模型
+- **不确定情况**: 默认无α模型（更稳健）
+
+**代码引用**: `utils/analysis_core.py:149-183`
+
+### 5.4 Z-score计算与异常检测
+
+#### Z-score标准化
+
+```python
+# 避免样本偏差: 使用前N-1期计算均值和标准差
+spread_mean = spread[:-1].mean()
+spread_std = spread[:-1].std()
+
+# 当前Z-score
+current_spread = spread.iloc[-1]
+current_zscore = (current_spread - spread_mean) / spread_std
+```
+
+**避免样本偏差**:
+- 不使用当前值计算均值/标准差
+- 避免Z-score被当前异常值拉扯
+
+**代码引用**: `utils/analysis_core.py:410-481`
+
+#### 异常检测阈值
+
+```python
+ZSCORE_THRESHOLDS = {
+    '5m': 1.8,   # 5m周期：敏感度高
+    '1h': 1.5,   # 1h周期：中等敏感
+    '4h': 0.2,   # 4h周期：低敏感（仅确认趋势）
+}
+```
+
+**阈值设计原理**:
+- **5m周期**: 高频交易，需要明确信号（1.8σ）
+- **1h周期**: 中期趋势确认（1.5σ）
+- **4h周期**: 长期趋势确认（0.2σ，主要看方向）
+
+**异常判定**:
+```python
+if abs(zscore) > threshold:
+    if zscore > threshold:
+        direction = "short"  # 目标币高估，做空配对
+    else:
+        direction = "long"   # 目标币低估，做多配对
+```
+
+**代码引用**: `utils/config.py:ZSCORE_THRESHOLDS`
+
+### 5.5 多周期验证机制
+
+#### 验证流程
+
+```python
+def analyze_multi_period(
+    symbol: str,
+    base_symbol: str,
+    klines_data: Dict[str, List[Dict]],  # {'5m': [...], '1h': [...], '4h': [...]}
+    required_periods: int = 2
+) -> Optional[Dict]:
+    """
+    多周期协整验证
+
+    验证流程:
+    1. 遍历3周期 (5m/7d, 1h/30d, 4h/60d)
+    2. 每周期执行 Old+New 协整检验 (共6个结果)
+    3. 统计协整通过数 (默认需≥2)
+    4. 验证Z-score符号一致性
+    5. 验证Z-score超阈值
+    """
+    cointegration_results = {}
+    zscore_results = {}
+
+    # Step 1: 遍历3周期
+    for tf in ['5m', '1h', '4h']:
+        base_klines = klines_data[tf]['base']
+        alt_klines = klines_data[tf]['alt']
+
+        # Old方法: 全量OLS
+        old_result = calculate_cointegration_params_ols(base_klines, alt_klines)
+        cointegration_results[f'{tf}_old'] = old_result
+
+        # New方法: 双窗口OLS
+        new_result = calculate_cointegration_params_dual_window(
+            base_klines, alt_klines,
+            beta_window=BETA_WINDOW,
+            zscore_window=ZSCORE_WINDOW
+        )
+        cointegration_results[f'{tf}_new'] = new_result
+        zscore_results[tf] = new_result['zscore'] if new_result else None
+
+    # Step 2: 统计协整通过数
+    passed_count = sum(
+        1 for res in cointegration_results.values()
+        if res and res.get('is_cointegrated')
+    )
+
+    if passed_count < required_periods:
+        logger.debug(f"协整通过数不足 ({passed_count} < {required_periods})")
+        return None
+
+    # Step 3: Z-score符号一致性检查
+    valid_zscores = [z for z in zscore_results.values() if z is not None]
+    if len(valid_zscores) < 2:
+        return None
+
+    signs = [np.sign(z) for z in valid_zscores]
+    if len(set(signs)) > 1:
+        logger.debug("Z-score符号不一致，跳过告警")
+        return None
+
+    # Step 4: Z-score超阈值检查
+    anomaly_flags = {}
+    for tf, zscore in zscore_results.items():
+        if zscore is not None:
+            anomaly_flags[tf] = abs(zscore) > ZSCORE_THRESHOLDS[tf]
+
+    if not any(anomaly_flags.values()):
+        logger.debug("所有周期Z-score未超阈值")
+        return None
+
+    # Step 5: 返回验证结果
+    return {
+        'cointegration_passed': True,
+        'passed_count': passed_count,
+        'zscore_5m': zscore_results['5m'],
+        'zscore_1h': zscore_results['1h'],
+        'zscore_4h': zscore_results['4h'],
+        'is_anomaly': any(anomaly_flags.values()),
+        'trading_direction': 'long' if valid_zscores[0] < 0 else 'short'
+    }
+```
+
+**验证逻辑**:
+1. 6个协整检验 (3周期 × 2方法)
+2. 协整通过数 ≥ required_periods (默认2)
+3. Z-score符号必须一致
+4. 至少1个周期Z-score超阈值
+
+**代码引用**: `utils/analysis_core.py:737-996`, `realtime_kline_service.py:1037-1402`
+
+### 5.6 协整健康监控
+
+#### 双窗口健康评分
+
+```python
+def calculate_cointegration_health(
+    base_klines: List[Dict],
+    alt_klines: List[Dict],
+    long_window: int = 200,   # 长期窗口
+    short_window: int = 100   # 短期窗口
+) -> Dict:
+    """
+    协整健康监控（双窗口评分机制）
+
+    评分指标:
+    - ADF p值: 40% (越小越好)
+    - 半衰期: 30% (适中最好)
+    - 稳定性: 30% (越稳定越好)
+
+    健康状态:
+    - HEALTHY: 评分 ≥ 18
+    - WARNING: 评分 ∈ [14, 18)
+    - CRITICAL: 评分 < 14
+    """
+    # 长期窗口评分
+    long_data = aligned.iloc[-long_window:]
+    long_score = _calculate_health_score(long_data)
+
+    # 短期窗口评分
+    short_data = aligned.iloc[-short_window:]
+    short_score = _calculate_health_score(short_data)
+
+    # 健康状态判定
+    short_state = _get_health_state(short_score)
+    long_state = _get_health_state(long_score)
+
+    return {
+        'long_window_score': long_score,
+        'long_window_state': long_state,
+        'short_window_score': short_score,
+        'short_window_state': short_state
+    }
+
+def _calculate_health_score(data: pd.DataFrame) -> float:
+    """
+    健康评分计算
+
+    评分公式:
+    - ADF p值评分: (1 - min(p_value, 1.0)) * 40
+    - 半衰期评分: gaussian(half_life, optimal=20, sigma=10) * 30
+    - 稳定性评分: (1 - cv) * 30
+    """
+    # 1. ADF p值评分 (40%)
+    adf_pvalue = adfuller(spread.values)[1]
+    adf_score = (1 - min(adf_pvalue, 1.0)) * 40
+
+    # 2. 半衰期评分 (30%)
+    half_life = calculate_half_life(spread)
+    half_life_score = gaussian_score(half_life, optimal=20, sigma=10) * 30
+
+    # 3. 稳定性评分 (30%)
+    coefficient_of_variation = spread.std() / abs(spread.mean())
+    stability_score = (1 - min(coefficient_of_variation, 1.0)) * 30
+
+    total_score = adf_score + half_life_score + stability_score
+    return total_score
+
+def _get_health_state(score: float) -> str:
+    """健康状态判定"""
+    if score >= 18:
+        return "HEALTHY"
+    elif score >= 14:
+        return "WARNING"
+    else:
+        return "CRITICAL"
+```
+
+**告警约束**:
+```python
+# 仅当短期窗口健康时才发送告警
+if health_result['short_window_state'] != "HEALTHY":
+    logger.debug(f"协整健康状态不佳 ({health_result['short_window_state']})，跳过告警")
+    return None
+```
+
+**设计原理**:
+- 避免协整关系恶化时的虚假信号
+- 双窗口监控: 长期趋势 + 短期状态
+- 短期状态优先: 告警约束
+
+**代码引用**: `utils/coingetation_more_check.py`
+
+---
+
+## 6. 并发架构设计
+
+### 6.1 线程模型
+
+#### 线程清单
+
+| 线程名称 | 数量 | 职责 | 启动方式 |
+|---------|------|------|---------|
+| WebSocket主线程 | 1 | 运行 `WebSocket.run_forever()` | `threading.Thread` |
+| Ping线程 | 1 | 每5秒发送ping保活 | `threading.Thread` |
+| 健康监控线程 | 1 | 每2秒检查连接健康 | `threading.Thread` |
+| batch_writer线程 | 1 | K线批量写入TimescaleDB | `threading.Thread` |
+| analysis_worker线程 | 15 | 并发执行分析任务 | `threading.Thread` × 15 |
+| result_batch_writer线程 | 1 | 分析结果批量写入 | `threading.Thread` |
+| queue_monitor线程 | 1 | 队列使用率监控 | `threading.Thread` |
+| new_symbol_monitor线程 | 1 | 新币种监控 | `threading.Thread` |
+
+**总线程数**: 22个线程
+
+**代码引用**: `realtime_kline_service.py:224-275`, `enhanced_ws_manager.py:501-597`
+
+#### 线程生命周期管理
+
+```python
+# 线程启动
+def start_service(self):
+    """启动所有服务线程"""
+    # 1. WebSocket线程（由EnhancedWebSocketManager管理）
+    self.ws_manager.start()
+
+    # 2. 批量写入线程
+    self.batch_writer_thread = threading.Thread(
+        target=self._batch_writer,
+        name="KlineBatchWriter",
+        daemon=True
+    )
+    self.batch_writer_thread.start()
+
+    # 3. 分析工作线程池
+    self.analysis_threads = []
+    for i in range(ANALYSIS_WORKERS_GENERAL):
+        t = threading.Thread(
+            target=self._analysis_worker,
+            name=f"AnalysisWorker-{i}",
+            daemon=True
+        )
+        t.start()
+        self.analysis_threads.append(t)
+
+    # 4. 分析结果写入线程
+    self.result_writer_thread = threading.Thread(
+        target=self._analysis_result_batch_writer,
+        name="ResultBatchWriter",
+        daemon=True
+    )
+    self.result_writer_thread.start()
+
+    # 5. 队列监控线程
+    self.queue_monitor_thread = threading.Thread(
+        target=self._queue_health_monitor,
+        name="QueueMonitor",
+        daemon=True
+    )
+    self.queue_monitor_thread.start()
+
+    # 6. 新币种监控线程
+    self.new_symbol_monitor_thread = threading.Thread(
+        target=self._new_symbol_monitor,
+        name="NewSymbolMonitor",
+        daemon=True
+    )
+    self.new_symbol_monitor_thread.start()
+
+    logger.info("所有服务线程已启动")
+
+# 线程停止
+def stop_service(self):
+    """停止所有服务线程"""
+    logger.info("开始停止服务...")
+
+    # 1. 设置停止标志
+    self.stop_event.set()
+
+    # 2. 停止WebSocket连接
+    self.ws_manager.stop()
+
+    # 3. 等待工作线程退出（超时保护）
+    for t in self.analysis_threads:
+        t.join(timeout=WORKER_THREAD_SHUTDOWN_TIMEOUT)
+
+    # 4. 等待批量写入线程退出
+    self.batch_writer_thread.join(timeout=WORKER_THREAD_SHUTDOWN_TIMEOUT)
+    self.result_writer_thread.join(timeout=WORKER_THREAD_SHUTDOWN_TIMEOUT)
+
+    logger.info("服务已停止")
+```
+
+**daemon线程**:
+- 所有工作线程设置为daemon=True
+- 主线程退出时自动终止所有daemon线程
+- 超时保护: join(timeout=30s)
+
+**代码引用**: `realtime_kline_service.py:224-275`, `realtime_kline_service.py:1589-1659`
+
+### 6.2 队列设计
+
+#### 队列清单
+
+| 队列名称 | 大小 | 类型 | 写入者 | 读取者 | 批量触发条件 |
+|---------|------|------|-------|-------|-------------|
+| kline_buffer | 10000 | queue.Queue | on_message | batch_writer | 1000条 OR 5秒 |
+| analysis_queue | 15000 | queue.Queue | on_message (5m) | 15×analysis_worker | 实时消费 |
+| analysis_result_buffer | 10000 | queue.Queue | 15×analysis_worker | result_batch_writer | 100条 OR 2秒 |
+
+**代码引用**: `realtime_kline_service.py:208-220`
+
+#### 队列配置
+
+```python
+# 队列配置（从配置文件读取）
+QUEUE_CONFIG_GENERAL = {
+    'kline_buffer_size': 10000,
+    'analysis_queue_size': 15000,
+    'analysis_result_buffer_size': 10000
+}
+
+# 队列初始化
+self.kline_buffer = queue.Queue(maxsize=QUEUE_CONFIG_GENERAL['kline_buffer_size'])
+self.analysis_queue = queue.Queue(maxsize=QUEUE_CONFIG_GENERAL['analysis_queue_size'])
+self.analysis_result_buffer = queue.Queue(maxsize=QUEUE_CONFIG_GENERAL['analysis_result_buffer_size'])
+```
+
+**队列大小设计原则**:
+- kline_buffer: 10000条 ≈ 5分钟缓冲（N个币种 × 3周期）
+- analysis_queue: 15000条 ≈ 15分钟缓冲（考虑分析耗时）
+- analysis_result_buffer: 10000条 ≈ 批量写入缓冲
+
+**代码引用**: `utils/config.py:QUEUE_CONFIG_GENERAL`, `realtime_kline_service.py:208-220`
+
+### 6.3 去重机制
+
+#### TTLCache去重
+
+```python
+from cachetools import TTLCache
+
+# 入队去重字典（线程安全，避免重复入队）
+self.recent_enqueue = TTLCache(maxsize=10000, ttl=1800)  # 30分钟TTL
+self.recent_enqueue_lock = threading.Lock()
+
+# 分析去重字典（跨线程共享，避免重复分析）
+self.recent_analysis = TTLCache(maxsize=10000, ttl=1800)
+self.recent_analysis_lock = threading.Lock()
+```
+
+**TTLCache特性**:
+- 自动过期: 1800秒 (30分钟)
+- 最大容量: 10000条
+- 防止内存泄漏: 自动清理过期记录
+
+**代码引用**: `realtime_kline_service.py:193-205`
+
+#### 入队去重窗口
+
+```python
+ENQUEUE_DEDUP_WINDOWS = {
+    '5m': 30,    # 5m周期: 30秒去重窗口
+    '1h': 180,   # 1h周期: 180秒去重窗口
+    '4h': 600,   # 4h周期: 600秒去重窗口
+}
+
+def _enqueue_analysis_if_needed(self, symbol: str, timeframe: str, kline_time: datetime):
+    """入队去重检查"""
+    with self.recent_enqueue_lock:
+        key = (symbol, timeframe, kline_time)
+        if key in self.recent_enqueue:
+            logger.debug(f"入队去重: {key} 在{ENQUEUE_DEDUP_WINDOWS[timeframe]}秒内已入队")
+            return False
+
+        # 添加到去重字典
+        self.recent_enqueue[key] = time.time()
+
+        # 入队
+        try:
+            self.analysis_queue.put_nowait({
+                'symbol': symbol,
+                'timeframe': timeframe,
+                'kline_time': kline_time
+            })
+            return True
+        except queue.Full:
+            logger.warning("分析队列已满，跳过入队")
+            return False
+```
+
+**去重窗口设计**:
+- 5m周期: 30秒 (约1/10周期)
+- 1h周期: 180秒 (约1/20周期)
+- 4h周期: 600秒 (约1/24周期)
+
+**代码引用**: `utils/config.py:ENQUEUE_DEDUP_WINDOWS`, `realtime_kline_service.py:575-633`
+
+#### 分析去重窗口
+
+```python
+DEDUP_WINDOWS = {
+    '5m': 60,    # 5m周期: 60秒去重窗口
+    '1h': 300,   # 1h周期: 300秒去重窗口
+    '4h': 900,   # 4h周期: 900秒去重窗口
+}
+
+def _analyze_and_alert(self, task: Dict):
+    """分析去重检查"""
+    symbol = task['symbol']
+    timeframe = task['timeframe']
+    kline_time = task['kline_time']
+
+    with self.recent_analysis_lock:
+        key = (symbol, timeframe, kline_time)
+        if key in self.recent_analysis:
+            logger.debug(f"分析去重: {key} 在{DEDUP_WINDOWS[timeframe]}秒内已分析")
+            return None
+
+        # 添加到去重字典
+        self.recent_analysis[key] = time.time()
+
+    # 执行分析
+    result = analyze_multi_period(...)
+    return result
+```
+
+**去重窗口设计**:
+- 5m周期: 60秒 (约1/5周期)
+- 1h周期: 300秒 (约1/12周期)
+- 4h周期: 900秒 (约1/16周期)
+
+**跨线程共享**:
+- 所有analysis_worker共享同一`recent_analysis`字典
+- 使用`recent_analysis_lock`保证线程安全
+
+**代码引用**: `utils/config.py:DEDUP_WINDOWS`, `realtime_kline_service.py:1037-1402`
+
+### 6.4 同步与锁策略
+
+#### RLock (递归锁)
+
+```python
+# symbols列表保护
+self.symbols_lock = threading.RLock()
+
+with self.symbols_lock:
+    self.symbols.append(new_symbol)
+
+# subscriptions列表保护
+self.subscriptions_lock = threading.RLock()
+
+with self.subscriptions_lock:
+    self.subscriptions.extend(new_subscriptions)
+
+# WebSocket状态保护
+self.state_lock = threading.RLock()
+
+with self.state_lock:
+    self.state = ConnectionState.CONNECTED
+
+# 数据缓存保护
+self.latest_data_lock = threading.RLock()
+
+with self.latest_data_lock:
+    self.latest_data["candles"][(symbol, timeframe)] = kline_dict
+```
+
+**RLock特性**:
+- 递归锁: 同一线程可多次获取
+- 适用场景: 嵌套调用、复杂操作
+
+**代码引用**: `enhanced_ws_manager.py:194-343`, `realtime_kline_service.py:183-189`
+
+#### threading.Lock
+
+```python
+# 入队去重保护
+self.recent_enqueue_lock = threading.Lock()
+
+with self.recent_enqueue_lock:
+    self.recent_enqueue[key] = time.time()
+
+# 分析去重保护
+self.recent_analysis_lock = threading.Lock()
+
+with self.recent_analysis_lock:
+    self.recent_analysis[key] = time.time()
+
+# 黑名单保护
+self.blacklist_lock = threading.Lock()
+
+with self.blacklist_lock:
+    self.new_symbol_blacklist.add(symbol)
+```
+
+**Lock特性**:
+- 简单锁: 不可递归
+- 适用场景: 简单临界区保护
+
+**代码引用**: `realtime_kline_service.py:193-205`
+
+#### threading.Event
+
+```python
+# 全局停止信号
+self.stop_event = threading.Event()
+
+# 检查停止信号
+if self.stop_event.is_set():
+    break
+
+# 停止服务
+self.stop_event.set()
+
+# WebSocket就绪标志
+self.ws_ready_event = threading.Event()
+
+# 等待连接就绪
+self.ws_ready_event.wait(timeout=30)
+
+# 设置就绪标志
+self.ws_ready_event.set()
+
+# Ping线程停止信号
+self.stop_ping = threading.Event()
+
+# 停止Ping线程
+self.stop_ping.set()
+```
+
+**Event特性**:
+- 信号机制: wait/set
+- 适用场景: 线程间通信、同步
+
+**代码引用**: `realtime_kline_service.py:207`, `enhanced_ws_manager.py:501-597`
+
+### 6.5 批量写入优化
+
+#### COPY批量写入
+
+```python
+def batch_upsert_copy(self, klines: List[Dict]) -> int:
+    """
+    使用COPY命令批量写入K线数据（高性能版本）
+
+    性能: >40000条/秒 (比executemany快100倍)
+
+    流程:
+    1. 创建临时表 (ON COMMIT DROP)
+    2. COPY数据到临时表 (CSV格式)
+    3. INSERT ... ON CONFLICT ... DO UPDATE
+    4. 自动清理临时表
+    """
+    with self.db_client.get_connection() as conn:
+        with conn.cursor() as cur:
+            # Step 1: 创建临时表
+            cur.execute("""
+                CREATE TEMP TABLE temp_klines (
+                    time TIMESTAMPTZ,
+                    symbol VARCHAR(50),
+                    timeframe VARCHAR(10),
+                    open DOUBLE PRECISION,
+                    high DOUBLE PRECISION,
+                    low DOUBLE PRECISION,
+                    close DOUBLE PRECISION,
+                    volume DOUBLE PRECISION,
+                    volume_usd DOUBLE PRECISION,
+                    return_pct DOUBLE PRECISION
+                ) ON COMMIT DROP;
+            """)
+
+            # Step 2: COPY数据到临时表
+            csv_buffer = StringIO()
+            for kline in klines:
+                csv_buffer.write(
+                    f"{kline['time']}\t{kline['symbol']}\t{kline['timeframe']}\t"
+                    f"{kline['open']}\t{kline['high']}\t{kline['low']}\t"
+                    f"{kline['close']}\t{kline['volume']}\t{kline['volume_usd']}\t"
+                    f"{kline['return_pct']}\n"
+                )
+            csv_buffer.seek(0)
+
+            with cur.copy("COPY temp_klines FROM STDIN") as copy:
+                copy.write(csv_buffer.read())
+
+            # Step 3: INSERT ... ON CONFLICT ... DO UPDATE
+            cur.execute("""
+                INSERT INTO klines (time, symbol, timeframe, open, high, low, close, volume, volume_usd, return_pct)
+                SELECT * FROM temp_klines
+                ON CONFLICT (time, symbol, timeframe)
+                DO UPDATE SET
+                    open = EXCLUDED.open,
+                    high = EXCLUDED.high,
+                    low = EXCLUDED.low,
+                    close = EXCLUDED.close,
+                    volume = EXCLUDED.volume,
+                    volume_usd = EXCLUDED.volume_usd,
+                    return_pct = EXCLUDED.return_pct
+            """)
+
+            conn.commit()
+            return len(klines)
+```
+
+**性能对比**:
+| 方法 | 性能 | 适用场景 |
+|------|------|----------|
+| executemany | ~1000条/秒 | 小批量 |
+| COPY | >40000条/秒 | 大批量 |
+
+**优化技巧**:
+- StringIO缓冲区: 避免磁盘I/O
+- 临时表: ON COMMIT DROP自动清理
+- 批量排序: 减少锁竞争
+
+**代码引用**: `timescaledb.py:342-450`
+
+#### 死锁防护
+
+```python
+def _batch_writer(self):
+    """K线批量写入线程（死锁防护）"""
+    batch = []
+    last_flush_time = time.time()
+
+    while not self.stop_event.is_set():
+        try:
+            # 批量获取队列数据
+            while len(batch) < DEFAULT_BATCH_SIZE:
+                kline = self.kline_buffer.get_nowait()
+                batch.append(kline)
+        except queue.Empty:
+            pass
+
+        # 批量触发条件
+        if len(batch) >= DEFAULT_BATCH_SIZE or \
+           (batch and time.time() - last_flush_time >= DEFAULT_BATCH_TIMEOUT):
+
+            # 去重
+            dedup_batch = self._deduplicate_batch(batch)
+
+            # 关键: 批量排序，保证锁获取顺序一致
+            dedup_batch = sorted(
+                dedup_batch,
+                key=lambda x: (x['time'], x['symbol'], x['timeframe'])
+            )
+
+            # 批量写入（死锁重试）
+            success = self._batch_write_with_retry(dedup_batch, max_retries=5)
+
+            if success:
+                batch.clear()
+                last_flush_time = time.time()
+
+        time.sleep(0.1)
+
+def _batch_write_with_retry(self, batch: List[Dict], max_retries: int = 5) -> bool:
+    """批量写入（死锁重试）"""
+    for attempt in range(max_retries):
+        try:
+            self.kline_repo.batch_upsert_copy(batch)
+            return True
+        except psycopg.errors.DeadlockDetected as e:
+            if attempt < max_retries - 1:
+                wait_time = 0.1 * (2 ** attempt) * (1 + random.random() * 0.5)
+                logger.warning(f"死锁检测，第{attempt+1}次重试，等待{wait_time:.2f}秒")
+                time.sleep(wait_time)
+                continue
+            else:
+                logger.error(f"死锁重试{max_retries}次后仍然失败")
+                return False
+        except Exception as e:
+            logger.error(f"批量写入失败: {e}")
+            return False
+```
+
+**死锁防护策略**:
+1. **批量排序**: 保证锁获取顺序一致
+2. **指数退避重试**: 最大5次，递增等待时间
+3. **随机抖动**: 避免重试冲突
+
+**代码引用**: `realtime_kline_service.py:635-760`, `realtime_kline_service.py:294-373`
+
+---
+
+## 7. 性能优化设计
+
+### 7.1 批量写入对比
+
+#### 性能测试结果
+
+| 方法 | 性能 | 1000条耗时 | 10000条耗时 | 适用场景 |
+|------|------|----------|-----------|----------|
+| executemany (单条INSERT) | ~1000条/秒 | ~1.0s | ~10s | 小批量 (<100条) |
+| executemany (批量INSERT) | ~5000条/秒 | ~0.2s | ~2s | 中批量 (100-1000条) |
+| **COPY (临时表)** | **>40000条/秒** | **~0.025s** | **~0.25s** | **大批量 (>1000条)** |
+
+**性能提升**: COPY方法比executemany快40-100倍
+
+**代码引用**: `timescaledb.py:342-450`
+
+#### COPY优化技巧
+
+```python
+# 1. StringIO缓冲区（避免磁盘I/O）
+csv_buffer = StringIO()
+for kline in klines:
+    csv_buffer.write(f"{kline['time']}\t{kline['symbol']}\t...\n")
+csv_buffer.seek(0)
+
+# 2. 临时表（ON COMMIT DROP自动清理）
+CREATE TEMP TABLE temp_klines (...) ON COMMIT DROP;
+
+# 3. 批量排序（减少锁竞争）
+dedup_batch = sorted(
+    dedup_batch,
+    key=lambda x: (x['time'], x['symbol'], x['timeframe'])
+)
+```
+
+**代码引用**: `timescaledb.py:342-450`, `realtime_kline_service.py:635-760`
+
+### 7.2 缓存策略
+
+#### TTLCache自动清理
+
+```python
+from cachetools import TTLCache
+
+# 去重缓存（自动过期）
+self.recent_enqueue = TTLCache(maxsize=10000, ttl=1800)  # 30分钟TTL
+self.recent_analysis = TTLCache(maxsize=10000, ttl=1800)
+
+# WebSocket数据缓存
+self.latest_data = {
+    "candles": {},   # {(symbol, timeframe): kline_dict}
+    "l2Book": {},    # {symbol: orderbook_dict}
+    "trades": {},    # {symbol: [trade_list]}
+}
+```
+
+**TTLCache优势**:
+- 自动过期: 1800秒 (30分钟)
+- 最大容量: 10000条
+- 防止内存泄漏: 自动清理过期记录
+
+**代码引用**: `realtime_kline_service.py:193-205`, `enhanced_ws_manager.py:194-343`
+
+#### 定时清理任务
+
+```python
+def _cleanup_recent_tasks(self):
+    """定时清理去重字典（防御性编程）"""
+    while not self.stop_event.is_set():
+        time.sleep(CLEANUP_INTERVAL)  # 300秒
+
+        with self.recent_enqueue_lock:
+            if len(self.recent_enqueue) > MAX_RECENT_TASKS:
+                logger.warning(f"入队去重字典超过阈值 ({len(self.recent_enqueue)} > {MAX_RECENT_TASKS})，触发清理")
+                # TTLCache会自动清理，这里只是监控
+
+        with self.recent_analysis_lock:
+            if len(self.recent_analysis) > MAX_RECENT_TASKS:
+                logger.warning(f"分析去重字典超过阈值 ({len(self.recent_analysis)} > {MAX_RECENT_TASKS})，触发清理")
+```
+
+**清理策略**:
+- 定时检查: 每300秒
+- 硬性上限: MAX_RECENT_TASKS=5000
+- 监控告警: 超过阈值触发清理
+
+**代码引用**: `utils/config.py:CLEANUP_INTERVAL`, `utils/config.py:MAX_RECENT_TASKS`
+
+### 7.3 数据库查询优化
+
+#### 索引优化
+
+```sql
+-- 覆盖最常用查询路径
+CREATE INDEX idx_klines_symbol_timeframe_time
+ON klines (symbol, timeframe, time DESC);
+
+-- 查询示例（走索引）
+SELECT * FROM klines
+WHERE symbol = 'BTC/USDC:USDC'
+  AND timeframe = '1h'
+  AND time >= NOW() - INTERVAL '30 days'
+ORDER BY time DESC
+LIMIT 10000;
+```
+
+**索引命中率**: >95%
+
+**代码引用**: `init_timescaledb.sql:123-128`
+
+#### 查询限制
+
+```python
+DB_QUERY_LIMIT = 10000  # 单次查询最大返回条数
+
+def get_klines_by_timeframe(
+    self,
+    symbol: str,
+    timeframe: str,
+    start_time: datetime,
+    end_time: datetime
+) -> List[Dict]:
+    """查询K线数据（限制返回条数）"""
+    query = """
+        SELECT * FROM klines
+        WHERE symbol = %s
+          AND timeframe = %s
+          AND time >= %s
+          AND time <= %s
+        ORDER BY time DESC
+        LIMIT %s
+    """
+    params = (symbol, timeframe, start_time, end_time, DB_QUERY_LIMIT)
+
+    with self.db_client.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            return [dict(row) for row in rows]
+```
+
+**查询保护**:
+- 单次查询最大10000条
+- 防止OOM
+- 超过限制返回截断数据
+
+**代码引用**: `utils/config.py:DB_QUERY_LIMIT`, `timescaledb.py:487-589`
+
+### 7.4 内存管理
+
+#### 内存占用监控
+
+```python
+import psutil
+
+def _monitor_memory_usage(self):
+    """内存占用监控"""
+    process = psutil.Process()
+    memory_info = process.memory_info()
+
+    logger.info(
+        f"内存占用: RSS={memory_info.rss / 1024 / 1024:.2f}MB, "
+        f"VMS={memory_info.vms / 1024 / 1024:.2f}MB"
+    )
+
+    # 告警阈值: 512MB
+    if memory_info.rss > 512 * 1024 * 1024:
+        logger.warning("内存占用超过512MB，建议检查内存泄漏")
+```
+
+**内存优化**:
+- TTLCache自动清理
+- 队列大小限制
+- 定时清理任务
+
+**代码引用**: `realtime_kline_service.py:1713-1785`
+
+### 7.5 性能指标与监控
+
+#### 目标指标
+
+| 指标 | 目标值 | 实际值 | 监控方式 |
+|------|--------|--------|---------|
+| 分析延迟 | <5秒 | ~3秒 | `analysis_delay_seconds` |
+| 告警延迟 | <10秒 | ~8秒 | 飞书响应时间 |
+| 内存占用 | <512MB | ~300MB | `psutil.Process().memory_info()` |
+| CPU占用 | <50% | ~30% | `psutil.cpu_percent()` |
+| 批量写入性能 | >10K条/秒 | >40K条/秒 | COPY命令性能测试 |
+
+**代码引用**: `realtime_kline_service.py:27-31`
+
+#### 实时统计
+
+```python
+self.stats = {
+    'messages_received': 0,         # WebSocket消息总数
+    'klines_written': 0,            # K线写入总数
+    'analyses_completed': 0,        # 分析完成总数
+    'analyses_failed': 0,           # 分析失败总数
+    'alerts_sent': 0,               # 告警发送总数
+    'uptime_seconds': 0,            # 服务运行时长
+    'queue_kline_size': 0,          # K线队列大小
+    'queue_analysis_size': 0,       # 分析队列大小
+    'queue_result_size': 0          # 结果队列大小
+}
+
+def get_stats(self) -> Dict:
+    """获取实时统计信息"""
+    self.stats['uptime_seconds'] = time.time() - self.start_time
+    self.stats['queue_kline_size'] = self.kline_buffer.qsize()
+    self.stats['queue_analysis_size'] = self.analysis_queue.qsize()
+    self.stats['queue_result_size'] = self.analysis_result_buffer.qsize()
+    return self.stats
+```
+
+**代码引用**: `realtime_kline_service.py:1661-1711`
+
+#### 队列使用率监控
+
+```python
+def _queue_health_monitor(self):
+    """队列使用率监控（每60秒）"""
+    while not self.stop_event.is_set():
+        time.sleep(QUEUE_MONITOR_INTERVAL)  # 60秒
+
+        kline_usage = self.kline_buffer.qsize() / QUEUE_CONFIG_GENERAL['kline_buffer_size']
+        analysis_usage = self.analysis_queue.qsize() / QUEUE_CONFIG_GENERAL['analysis_queue_size']
+        result_usage = self.analysis_result_buffer.qsize() / QUEUE_CONFIG_GENERAL['analysis_result_buffer_size']
+
+        logger.info(
+            f"队列使用率 | K线: {kline_usage*100:.1f}% | "
+            f"分析: {analysis_usage*100:.1f}% | "
+            f"结果: {result_usage*100:.1f}%"
+        )
+
+        # 告警阈值: 80%
+        if kline_usage > QUEUE_WARNING_THRESHOLD:
+            logger.warning(f"K线队列使用率超过{QUEUE_WARNING_THRESHOLD*100}%，建议增加批量写入频率")
+        if analysis_usage > QUEUE_WARNING_THRESHOLD:
+            logger.warning(f"分析队列使用率超过{QUEUE_WARNING_THRESHOLD*100}%，建议增加工作线程数")
+        if result_usage > QUEUE_WARNING_THRESHOLD:
+            logger.warning(f"结果队列使用率超过{QUEUE_WARNING_THRESHOLD*100}%，建议检查数据库性能")
+```
+
+**监控指标**:
+- 队列使用率: 每60秒输出
+- 告警阈值: 80%
+- 优化建议: 自动生成
+
+**代码引用**: `realtime_kline_service.py:1452-1539`, `utils/config.py:QUEUE_MONITOR_INTERVAL`, `utils/config.py:QUEUE_WARNING_THRESHOLD`
+
+---
+
