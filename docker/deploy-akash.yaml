@@ -58,18 +58,18 @@ profiles:
       resources:
         # CPU 配置
         cpu:
-          units: 2.0  # 2 CPU 核心
+          units: 0.5  # 2 CPU 核心
           # attributes:
           #   arch: amd64  # 指定 CPU 架构（可选）
 
         # 内存配置
         memory:
-          size: 4Gi  # 4GB 内存
+          size: 2Gi  # 4GB 内存
 
         # 存储配置
         storage:
           # ⚠️ 关键配置：临时存储
-          - size: 20Gi  # 20GB 存储空间
+          - size: 5Gi  # 20GB 存储空间
             # 临时存储（默认）- 容器重启数据丢失
             # 如需持久化（beta 功能，不稳定）：
             # attributes:
