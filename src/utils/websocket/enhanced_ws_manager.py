@@ -30,7 +30,8 @@ from src.utils.core.config import (
     WS_RECONNECT_MAX_DELAY, WS_RECONNECT_MULTIPLIER, WS_RECONNECT_JITTER,
     WS_URL, WS_TIMEOUT, WS_MAX_RETRIES, WS_ALERT_THRESHOLD,
     WS_HEALTH_MONITOR_TIMEOUT, WS_HEALTH_MONITOR_WARNING_THRESHOLD,
-    WS_CLEANUP_DELAY, WS_HEALTH_REPORT_INTERVAL, WS_HEALTH_CHECK_INTERVAL
+    WS_CLEANUP_DELAY, WS_HEALTH_REPORT_INTERVAL, WS_HEALTH_CHECK_INTERVAL,
+    WS_SUBSCRIBE_BATCH_SIZE, WS_SUBSCRIBE_BATCH_DELAY
 )
 
 
@@ -605,8 +606,14 @@ class EnhancedWebSocketManager:
             subscriptions_to_use = list(self.subscriptions)
             self.active_subscriptions.clear()
 
-        # 发送订阅消息
-        for subscription in subscriptions_to_use:
+        # ⭐ 修复: 批量订阅,避免瞬时大量请求
+        total_subs = len(subscriptions_to_use)
+        success_count = 0
+        failed_count = 0
+
+        logger.info(f"开始批量订阅: {total_subs} 个订阅 (批次大小: {WS_SUBSCRIBE_BATCH_SIZE}, 间隔: {WS_SUBSCRIBE_BATCH_DELAY}s)")
+
+        for i, subscription in enumerate(subscriptions_to_use):
             try:
                 msg = {"method": "subscribe", "subscription": subscription}
                 ws.send(json.dumps(msg))
@@ -618,9 +625,19 @@ class EnhancedWebSocketManager:
                     subscription.get('interval')
                 )
                 self.active_subscriptions.add(sub_key)
-                logger.debug(f"订阅成功: {subscription}")
+                success_count += 1
+                logger.debug(f"订阅成功 [{i+1}/{total_subs}]: {subscription}")
+
+                # 每批次间隔延迟,防止服务器限流
+                if (i + 1) % WS_SUBSCRIBE_BATCH_SIZE == 0 and (i + 1) < total_subs:
+                    logger.debug(f"批次完成 {i+1}/{total_subs}, 等待 {WS_SUBSCRIBE_BATCH_DELAY}s...")
+                    time.sleep(WS_SUBSCRIBE_BATCH_DELAY)
+
             except Exception as e:
-                logger.error(f"订阅失败: {subscription} | {e}")
+                logger.error(f"订阅失败 [{i+1}/{total_subs}]: {subscription} | {e}")
+                failed_count += 1
+
+        logger.info(f"批量订阅完成: 成功 {success_count} 个, 失败 {failed_count} 个")
 
         # 启动 Ping 线程
         self.stop_ping.clear()
@@ -795,7 +812,7 @@ class EnhancedWebSocketManager:
         - 线程安全：使用锁保护订阅列表
         - 即时订阅：连接已建立时立即调用Info.subscribe()
         - 延迟订阅：连接未建立时添加到列表，重连时自动订阅
-        
+
         注意：如果订阅失败，会从订阅列表中移除该订阅
         """
         if not new_subscriptions:
@@ -804,6 +821,7 @@ class EnhancedWebSocketManager:
         try:
             added_count = 0
             skipped_count = 0
+            failed_count = 0
 
             with self.subscriptions_lock:
                 for subscription in new_subscriptions:
@@ -823,30 +841,38 @@ class EnhancedWebSocketManager:
                     # 添加到订阅列表
                     self.subscriptions.append(subscription)
 
-                    # 如果连接已建立，立即订阅
-                    if self._is_connected():
+                    # ⭐ 修复: 增强连接状态检查，避免在重连期间订阅
+                    if self.state == ConnectionState.CONNECTED and self._is_connected():
                         try:
-                            # ✅ 直接发送订阅消息
+                            # ⭐ 修复: 再次检查ws对象和连接状态
+                            if not self.ws or not self.ws.keep_running:
+                                logger.warning(f"📋 延迟订阅: 连接不稳定 | {subscription.get('coin')} @ {subscription.get('interval')}")
+                                added_count += 1
+                                continue
+
+                            # ✅ 发送订阅消息
                             msg = {"method": "subscribe", "subscription": subscription}
                             self.ws.send(json.dumps(msg))
 
                             self.active_subscriptions.add(sub_key)
                             added_count += 1
-                            logger.info(f"✅ 动态订阅成功: {subscription.get('coin')} @ {subscription.get('interval')}")
+                            logger.debug(f"✅ 动态订阅成功: {subscription.get('coin')} @ {subscription.get('interval')}")
                         except Exception as e:
-                            logger.error(f"动态订阅失败: {sub_key} | {e}")
+                            logger.error(f"订阅失败: {subscription} | {e}")
                             # 订阅失败，从列表移除
                             self.subscriptions.remove(subscription)
+                            failed_count += 1
                     else:
-                        # 连接未建立，只添加到列表（重连时自动订阅）
+                        # 连接未建立或重连中，只添加到列表（重连时自动订阅）
                         added_count += 1
-                        logger.info(f"📋 延迟订阅已添加: {subscription.get('coin')} @ {subscription.get('interval')} (重连时生效)")
+                        logger.debug(f"📋 延迟订阅已添加: {subscription.get('coin')} @ {subscription.get('interval')} (重连时生效)")
 
-            logger.info(
-                f"动态订阅完成: 新增 {added_count} 个订阅，跳过 {skipped_count} 个重复订阅 | "
-                f"总订阅数: {len(self.subscriptions)}"
-            )
-            return True
+            if added_count > 0 or skipped_count > 0 or failed_count > 0:
+                logger.info(
+                    f"动态订阅完成: 新增 {added_count} 个，跳过 {skipped_count} 个重复，失败 {failed_count} 个 | "
+                    f"总订阅数: {len(self.subscriptions)}"
+                )
+            return failed_count == 0
 
         except Exception as e:
             logger.error(f"动态添加订阅失败: {e}", exc_info=True)

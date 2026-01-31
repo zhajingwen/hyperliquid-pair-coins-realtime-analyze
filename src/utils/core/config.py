@@ -105,7 +105,7 @@ ALERT_PROGRESS_BAR_WIDTH = 10  # 进度条宽度
 ALERT_ZSCORE_MAX_VALUE = 3.0  # Z-score最大显示值
 
 # ============ WebSocket配置 ============
-WS_TIMEOUT = 30
+WS_TIMEOUT = 60  # ⭐ 修复: 增加超时时间到60秒,适应线上网络环境
 WS_MAX_RETRIES = None
 WS_ALERT_THRESHOLD = None
 WS_URL = "wss://api.hyperliquid.xyz/ws"  # WebSocket连接地址
@@ -123,6 +123,8 @@ WS_HEALTH_MONITOR_WARNING_THRESHOLD = 15  # 健康监控警告阈值(秒) - 超�
 WS_HEALTH_REPORT_INTERVAL = 60  # 健康报告输出间隔(秒) - 定期输出健康统计信息
 WS_HEALTH_CHECK_INTERVAL = 2  # 健康检查循环间隔(秒) - 健康监控线程检查频率
 WS_CLEANUP_DELAY = 0.5  # 强制清理连接延迟(秒) - 清理旧连接前的等待时间
+WS_SUBSCRIBE_BATCH_SIZE = 50  # ⭐ 新增: 批量订阅大小,避免瞬时大量请求
+WS_SUBSCRIBE_BATCH_DELAY = 0.1  # ⭐ 新增: 批量订阅间隔(秒),防止服务器限流
 
 # ============ K线数据补充器配置 ============
 KLINE_FILLER_COOLDOWN_SECONDS = 600  # 补充冷却时间(秒)
