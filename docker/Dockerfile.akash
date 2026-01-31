@@ -20,12 +20,11 @@ COPY database/init_timescaledb.sql /docker-entrypoint-initdb.d/01-init.sql
 # 2. 安装必要工具
 # =====================================================
 
-RUN apt-get update && apt-get install -y \
+RUN apk add --no-cache \
     curl \
     wget \
     postgresql-client \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+    bash
 
 # =====================================================
 # 3. PostgreSQL 优化配置（针对 Akash 4GB 内存）
