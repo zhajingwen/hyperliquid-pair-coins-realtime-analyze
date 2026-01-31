@@ -1,0 +1,230 @@
+# =====================================================
+# TimescaleDB for Akash Network
+# 包含初始化脚本和优化配置
+# =====================================================
+
+FROM timescale/timescaledb:latest-pg16
+
+LABEL maintainer="crypto-analysis"
+LABEL description="TimescaleDB for Hyperliquid Pair Analysis on Akash"
+LABEL version="1.0"
+
+# =====================================================
+# 1. 复制初始化脚本
+# =====================================================
+
+# 将初始化脚本复制到 Docker entrypoint 目录
+COPY database/init_timescaledb.sql /docker-entrypoint-initdb.d/01-init.sql
+
+# =====================================================
+# 2. 安装必要工具
+# =====================================================
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    postgresql-client \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# =====================================================
+# 3. PostgreSQL 优化配置（针对 Akash 4GB 内存）
+# =====================================================
+
+RUN cat >> /usr/share/postgresql/postgresql.conf.sample <<EOF
+
+# ===== Akash 优化配置 =====
+# 针对 2 CPU, 4GB 内存
+
+# 连接配置
+max_connections = 50
+superuser_reserved_connections = 3
+
+# 内存配置
+shared_buffers = 1GB                    # 25% of RAM
+effective_cache_size = 3GB              # 75% of RAM
+maintenance_work_mem = 256MB
+work_mem = 10MB                         # (1GB / max_connections)
+wal_buffers = 16MB
+
+# Checkpoint 配置
+checkpoint_timeout = 15min
+checkpoint_completion_target = 0.9
+max_wal_size = 4GB
+min_wal_size = 1GB
+
+# 查询规划
+default_statistics_target = 100
+random_page_cost = 1.1
+effective_io_concurrency = 200
+
+# 日志配置（减少 I/O）
+logging_collector = on
+log_directory = 'log'
+log_filename = 'postgresql-%a.log'
+log_truncate_on_rotation = on
+log_rotation_age = 1d
+log_line_prefix = '%m [%p] %q%u@%d '
+log_timezone = 'UTC'
+
+# TimescaleDB 特定配置
+timescaledb.max_background_workers = 8
+
+# 性能优化
+synchronous_commit = off               # ⚠️ 提升性能，但重启可能丢失最后几秒数据
+fsync = on                             # 保持开启，保证数据完整性
+full_page_writes = on
+
+EOF
+
+# =====================================================
+# 4. 创建健康检查脚本
+# =====================================================
+
+RUN cat > /usr/local/bin/healthcheck.sh <<'EOF'
+#!/bin/bash
+set -e
+
+# 检查 PostgreSQL 是否运行
+pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres}
+
+# 检查 TimescaleDB 扩展
+psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres} -tAc "SELECT 1 FROM pg_extension WHERE extname='timescaledb';" | grep -q 1
+
+echo "✅ 健康检查通过"
+EOF
+
+RUN chmod +x /usr/local/bin/healthcheck.sh
+
+# =====================================================
+# 5. 创建备份脚本（手动触发）
+# =====================================================
+
+RUN cat > /usr/local/bin/backup.sh <<'EOF'
+#!/bin/bash
+set -e
+
+BACKUP_DIR="/var/lib/postgresql/backups"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="${BACKUP_DIR}/backup_${TIMESTAMP}.sql.gz"
+
+mkdir -p ${BACKUP_DIR}
+
+echo "🔄 开始备份..."
+pg_dump -U ${POSTGRES_USER:-postgres} ${POSTGRES_DB:-postgres} | gzip > ${BACKUP_FILE}
+
+FILE_SIZE=$(du -h ${BACKUP_FILE} | cut -f1)
+echo "✅ 备份完成: ${BACKUP_FILE} (${FILE_SIZE})"
+
+# 清理 3 天前的备份
+find ${BACKUP_DIR} -name "backup_*.sql.gz" -mtime +3 -delete
+echo "🗑️  旧备份已清理"
+EOF
+
+RUN chmod +x /usr/local/bin/backup.sh
+
+# =====================================================
+# 6. 创建监控脚本
+# =====================================================
+
+RUN cat > /usr/local/bin/monitor.sh <<'EOF'
+#!/bin/bash
+
+echo "📊 数据库监控信息"
+echo "===================="
+
+# 数据库大小
+echo "📦 数据库大小:"
+psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres} -c "
+SELECT pg_size_pretty(pg_database_size('${POSTGRES_DB:-postgres}')) AS db_size;
+"
+
+# 连接数
+echo "🔗 连接数:"
+psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres} -c "
+SELECT count(*) as connections FROM pg_stat_activity WHERE datname = '${POSTGRES_DB:-postgres}';
+"
+
+# Hypertable 统计
+echo "⏰ Hypertable 统计:"
+psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres} -c "
+SELECT hypertable_name, num_chunks, total_bytes/1024/1024 as total_mb
+FROM timescaledb_information.hypertables h
+JOIN LATERAL (
+  SELECT sum(total_bytes)::bigint as total_bytes
+  FROM hypertable_detailed_size(format('%I.%I', h.hypertable_schema, h.hypertable_name)::regclass)
+) s ON true;
+"
+
+# 表记录数
+echo "📊 表记录数:"
+psql -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres} -c "
+SELECT
+  'klines' as table_name,
+  count(*) as row_count
+FROM klines
+UNION ALL
+SELECT
+  'analysis_results',
+  count(*)
+FROM analysis_results
+UNION ALL
+SELECT
+  'symbol_metadata',
+  count(*)
+FROM symbol_metadata;
+"
+
+EOF
+
+RUN chmod +x /usr/local/bin/monitor.sh
+
+# =====================================================
+# 7. 环境变量默认值
+# =====================================================
+
+ENV POSTGRES_DB=crypto_data \
+    POSTGRES_USER=postgres \
+    TIMESCALEDB_TELEMETRY=off \
+    TZ=UTC
+
+# ⚠️ POSTGRES_PASSWORD 必须通过 Akash SDL 设置！
+
+# =====================================================
+# 8. 创建备份目录
+# =====================================================
+
+RUN mkdir -p /var/lib/postgresql/backups && \
+    chown -R postgres:postgres /var/lib/postgresql/backups
+
+# =====================================================
+# 9. 暴露端口
+# =====================================================
+
+EXPOSE 5432
+
+# =====================================================
+# 10. 健康检查（Docker 层面，Akash 不使用）
+# =====================================================
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD /usr/local/bin/healthcheck.sh || exit 1
+
+# =====================================================
+# 使用说明
+# =====================================================
+
+# 构建镜像：
+# cd /Users/test/Downloads/hyperliquid-pair-hype-purr-analyze
+# docker build -t <your-dockerhub-username>/crypto-timescaledb-akash:v1.0 -f docker/Dockerfile.akash .
+
+# 本地测试：
+# docker run -d \
+#   -e POSTGRES_PASSWORD=test123 \
+#   -p 5432:5432 \
+#   <your-dockerhub-username>/crypto-timescaledb-akash:v1.0
+
+# 推送到 Docker Hub：
+# docker login
+# docker push <your-dockerhub-username>/crypto-timescaledb-akash:v1.0
+
