@@ -21,8 +21,6 @@ ENV POSTGRES_DB=crypto_data \
     TIMESCALEDB_TELEMETRY=off \
     TZ=UTC
 
-EXPOSE 5432
-
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD /usr/local/bin/healthcheck.sh || exit 1
 

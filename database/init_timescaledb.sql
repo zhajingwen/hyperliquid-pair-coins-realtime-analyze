@@ -18,8 +18,8 @@ CREATE EXTENSION IF NOT EXISTS timescaledb;
 -- 用途: 存储多币种、多周期的K线数据
 CREATE TABLE IF NOT EXISTS klines (
     time TIMESTAMPTZ NOT NULL,
-    symbol VARCHAR(50) NOT NULL,
-    timeframe VARCHAR(10) NOT NULL,
+    symbol TEXT NOT NULL,
+    timeframe TEXT NOT NULL,
     open DOUBLE PRECISION NOT NULL,
     high DOUBLE PRECISION NOT NULL,
     low DOUBLE PRECISION NOT NULL,
@@ -38,9 +38,9 @@ CREATE TABLE IF NOT EXISTS klines (
 -- 表2: symbol_metadata (币种元数据表)
 -- 用途: 追踪币种上线时间、数据质量、活跃状态
 CREATE TABLE IF NOT EXISTS symbol_metadata (
-    symbol VARCHAR(50) PRIMARY KEY,
-    base_asset VARCHAR(20) NOT NULL,
-    quote_asset VARCHAR(20) NOT NULL,
+    symbol TEXT PRIMARY KEY,
+    base_asset TEXT NOT NULL,
+    quote_asset TEXT NOT NULL,
     listing_time TIMESTAMPTZ,
     is_active BOOLEAN DEFAULT TRUE,
     data_quality_score DOUBLE PRECISION DEFAULT 0.0,
@@ -56,8 +56,8 @@ CREATE TABLE IF NOT EXISTS symbol_metadata (
 CREATE TABLE IF NOT EXISTS analysis_results (
     id SERIAL,
     analysis_time TIMESTAMPTZ NOT NULL,
-    symbol VARCHAR(50) NOT NULL,
-    base_symbol VARCHAR(50) NOT NULL,
+    symbol TEXT NOT NULL,
+    base_symbol TEXT NOT NULL,
 
     -- 时间链路字段
     kline_time TIMESTAMPTZ,                    -- K线原始时间（新增）
@@ -79,8 +79,8 @@ CREATE TABLE IF NOT EXISTS analysis_results (
 
     -- 信号标识
     is_anomaly BOOLEAN DEFAULT FALSE,
-    trading_direction VARCHAR(50),
-    signal_strength VARCHAR(20),
+    trading_direction TEXT,
+    signal_strength TEXT,
 
     created_at TIMESTAMPTZ DEFAULT NOW(),
 
