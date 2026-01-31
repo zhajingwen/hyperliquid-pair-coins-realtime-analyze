@@ -28,7 +28,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository }}/timescaledb-akash
           tags: |
             type=ref,event=branch
             type=sha,prefix={{branch}}-
@@ -37,6 +37,8 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},enable={{is_default_branch}}
             type=semver,pattern={{major}},enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}
+          flavor: |
+            latest=auto
       
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -49,12 +51,16 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: docker/Dockerfile.akash
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ steps.meta.outputs.created }}
+            VCS_REF=${{ github.sha }}
       
       - name: Save image information
         run: |
