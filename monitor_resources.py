@@ -219,10 +219,13 @@ def monitor_resources(interval: int = 5, show_details: bool = True):
         iteration = 0
         while True:
             iteration += 1
-            os.system('clear' if os.name == 'posix' else 'cls')
+
+            # 使用分隔线代替清屏
+            if iteration > 1:
+                print(f"\n{Colors.BOLD}{'─'*80}{Colors.NC}\n")
 
             current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            print(f"\n{Colors.BOLD}{'='*80}{Colors.NC}")
+            print(f"{Colors.BOLD}{'='*80}{Colors.NC}")
             print(f"{Colors.CYAN}{Colors.BOLD}  监控时间: {current_time} (第 {iteration} 次刷新){Colors.NC}")
             print(f"{Colors.BOLD}{'='*80}{Colors.NC}")
 
