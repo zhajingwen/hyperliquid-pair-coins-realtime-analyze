@@ -1,55 +1,26 @@
 ---
-# =====================================================
-# Akash Network SDL 完整部署配置
-# 项目: Hyperliquid Pair Analysis - TimescaleDB
-# 版本: 1.0
-# 环境: 测试/开发
-# =====================================================
-
 version: "2.0"
-
-# =====================================================
-# 服务定义
-# =====================================================
 services:
   timescaledb:
-    # Docker 镜像（需要先构建并推送）
-    # ⚠️ 替换为你的 Docker Hub 用户名
-    image: YOUR_DOCKERHUB_USERNAME/crypto-timescaledb-akash:v1.0
-
-    # 环境变量配置
-    env:
-      # 数据库配置
-      - POSTGRES_DB=crypto_data
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=CHANGE_ME_STRONG_PASSWORD_123  # ⚠️ 必须修改！
-
-      # TimescaleDB 配置
-      - TIMESCALEDB_TELEMETRY=off
-
-      # 时区配置
-      - TZ=UTC
-
-      # PostgreSQL 运行时配置（可选）
-      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
-
-    # 端口暴露配置
+    image: >-
+      ghcr.io/zhajingwen/hyperliquid-pair-coins-realtime-analyze/timescaledb-akash:latest
     expose:
-      # PostgreSQL 主端口
       - port: 5432
         as: 80
         to:
-          - global: true  # ⚠️ 暴露到公网，仅测试环境使用
-
-        # 🔐 生产环境建议：
-        # to:
-        #   - global: false  # 仅内部访问
-        # accept:
-        #   - <your-allowed-ip>  # IP 白名单
-
-# =====================================================
-# 资源配置 Profiles
-# =====================================================
+          - global: true
+    env:
+      - POSTGRES_DB=crypto_data
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=CHANGE_ME_STRONG_PASSWORD_123
+      - TIMESCALEDB_TELEMETRY=off
+      - TZ=UTC
+      - POSTGRES_INITDB_ARGS=--encoding=UTF8 --locale=C
+    params:
+      storage:
+        data:
+          mount: /mnt/data
+          readOnly: false
 profiles:
   compute:
     timescaledb:
@@ -57,188 +28,22 @@ profiles:
         cpu:
           units: 0.5
         memory:
-          size: 1.5Gi
+          size: 1Gi
         storage:
           - size: 5Gi
+          - name: data
+            size: 5Gi
             attributes:
               persistent: true
               class: beta3
-  # 部署位置配置
   placement:
-    akash:
-      # 定价策略
+    dcloud:
       pricing:
         timescaledb:
           denom: uakt
-          amount: 10000  # 最高出价 10000 uAKT (~$0.10/month)
-
-      # 提供商筛选条件
-      attributes:
-        # 推荐：选择可信提供商
-        host: akash
-
-        # 地区偏好（可选）
-        # region: us-west
-        # region: eu-west
-
-        # 数据中心等级（可选）
-        # tier: community  # community, professional, enterprise
-
-      # 提供商签名要求（可选）
-      signedBy:
-        anyOf:
-          # 添加可信提供商的地址（可选）
-          # - "akash1abcdef..."
-          # - "akash1ghijkl..."
-
-# =====================================================
-# 部署配置
-# =====================================================
+          amount: 10000
 deployment:
   timescaledb:
-    akash:
+    dcloud:
       profile: timescaledb
-      count: 1  # 单实例部署
-
-# =====================================================
-# 使用说明
-# =====================================================
-
-# 📋 部署前检查清单
-# ====================
-# [ ] 已构建并推送 Docker 镜像
-# [ ] 已修改 image 字段为你的镜像名
-# [ ] 已设置强密码（POSTGRES_PASSWORD）
-# [ ] 已安装 Akash CLI
-# [ ] 钱包中有足够的 AKT 代币（最低 5 AKT）
-# [ ] 理解数据可能丢失的风险
-
-# 🚀 部署步骤
-# ====================
-
-# 1. 创建部署
-# akash tx deployment create deploy-akash.yaml \
-#   --from <your-wallet-name> \
-#   --chain-id akashnet-2 \
-#   --node https://rpc.akashnet.net:443 \
-#   --fees 5000uakt \
-#   --gas auto \
-#   --gas-adjustment 1.3
-
-# 2. 查询部署状态
-# akash query deployment list --owner <your-akash-address>
-
-# 3. 查看市场报价
-# akash query market bid list --owner <your-akash-address>
-
-# 4. 选择提供商并创建租约
-# akash tx market lease create \
-#   --dseq <deployment-sequence> \
-#   --from <your-wallet-name> \
-#   --provider <provider-address> \
-#   --fees 5000uakt
-
-# 5. 查询租约状态
-# akash query market lease list --owner <your-akash-address>
-
-# 6. 获取服务访问信息
-# akash provider lease-status \
-#   --dseq <deployment-sequence> \
-#   --from <your-wallet-name> \
-#   --provider <provider-address>
-
-# 输出示例：
-# {
-#   "services": {
-#     "timescaledb": {
-#       "uris": ["provider.akash.network:12345"]
-#     }
-#   }
-# }
-
-# 7. 连接数据库
-# psql -h provider.akash.network -p 12345 -U postgres -d crypto_data
-
-# 📊 监控和管理
-# ====================
-
-# 查看日志
-# akash provider lease-logs \
-#   --dseq <deployment-sequence> \
-#   --from <your-wallet-name> \
-#   --provider <provider-address> \
-#   --follow
-
-# 执行监控脚本
-# akash provider lease-shell \
-#   --dseq <deployment-sequence> \
-#   --from <your-wallet-name> \
-#   --provider <provider-address> \
-#   --service timescaledb \
-#   /usr/local/bin/monitor.sh
-
-# 手动备份
-# akash provider lease-shell ... /usr/local/bin/backup.sh
-
-# 🔄 更新部署
-# ====================
-
-# 1. 修改 deploy-akash.yaml
-# 2. 更新部署
-# akash tx deployment update deploy-akash.yaml \
-#   --dseq <deployment-sequence> \
-#   --from <your-wallet-name>
-
-# 🛑 关闭部署
-# ====================
-
-# akash tx deployment close \
-#   --dseq <deployment-sequence> \
-#   --from <your-wallet-name>
-
-# =====================================================
-# ⚠️ 重要提醒
-# =====================================================
-
-# 1. 数据持久化
-#    - 当前配置使用临时存储
-#    - 容器重启或提供商变更会导致数据丢失
-#    - 建议定期备份到外部存储（S3、云存储）
-
-# 2. 安全配置
-#    - 数据库暴露在公网，存在安全风险
-#    - 建议使用强密码
-#    - 考虑使用 VPN 或 SSH 隧道访问
-#    - 定期更新密码
-
-# 3. 成本控制
-#    - 监控实际花费（akash query escrow account）
-#    - 设置预算提醒
-#    - 不使用时及时关闭部署
-
-# 4. 性能优化
-#    - 根据实际使用调整资源配置
-#    - 监控数据库性能指标
-#    - 优化查询和索引
-
-# 5. 备份策略
-#    - 定期执行 /usr/local/bin/backup.sh
-#    - 将备份导出到本地或云存储
-#    - 测试备份恢复流程
-
-# =====================================================
-# 💰 成本估算（2024年市场价格）
-# =====================================================
-
-# CPU: 2 核 × $0.012/月 = $0.024
-# 内存: 4GB × $0.0007/GB/月 = $0.0028
-# 存储: 20GB × $0.00015/GB/月 = $0.003
-# --------------------------------------------
-# 理论最低: ~$0.03/月
-# 实际价格: $1-5/月（提供商竞价）
-
-# 对比 VPS: $12-20/月
-# 节省: ~85-95% 💰
-
-# ⚠️ 但要考虑数据丢失风险和运维成本
-
+      count: 1
