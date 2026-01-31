@@ -424,7 +424,7 @@ class KlineDataFiller:
 
         logger.info(
             f"精准补充K线数据 | {symbol} @ {timeframe} | "
-            f"缺失点数: {len(missing_timestamps)} | 拉取: {limit} 条 | "
+            f"缺失: {len(missing_timestamps)} | 实际拉取: {limit} 条 (含缓冲) | "
             f"范围: {start_time.isoformat()} ~ {end_time.isoformat()}"
         )
 
