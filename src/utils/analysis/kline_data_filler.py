@@ -21,6 +21,9 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta, timezone
 
 import ccxt
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from src.utils.database.timescaledb import KlineRepository, TimescaleDBClient
@@ -113,6 +116,30 @@ class KlineDataFiller:
             ccxt.Exchange: 交易所实例
         """
         try:
+            # ⭐ 修复: 创建自定义 requests.Session 对象配置连接池
+            session = requests.Session()
+
+            # 配置重试策略
+            retry_strategy = Retry(
+                total=HTTP_POOL_MAX_RETRIES,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
+            )
+
+            # 创建 HTTP 适配器并配置连接池
+            adapter = HTTPAdapter(
+                pool_connections=HTTP_POOL_CONNECTIONS,
+                pool_maxsize=HTTP_POOL_SIZE,
+                max_retries=retry_strategy,
+                pool_block=HTTP_POOL_BLOCK
+            )
+
+            # 挂载适配器到 session（http 和 https）
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+
+            # 初始化 CCXT 交易所
             exchange_class = getattr(ccxt, exchange_id)
             exchange = exchange_class({
                 'enableRateLimit': True,
@@ -122,13 +149,7 @@ class KlineDataFiller:
                     'defaultType': 'swap',
                     'recvWindow': 60000,  # 接收窗口60秒
                 },
-                # ⭐ 修复: 配置连接池避免 "Connection pool is full" 警告
-                'session': {
-                    'pool_maxsize': HTTP_POOL_SIZE,           # 连接池最大连接数(10 → 50)
-                    'pool_connections': HTTP_POOL_CONNECTIONS, # 连接池数量
-                    'max_retries': HTTP_POOL_MAX_RETRIES,     # 最大重试次数
-                    'pool_block': HTTP_POOL_BLOCK              # 池满时不阻塞
-                }
+                'session': session  # 传递配置好的 session 对象
             })
             logger.info(f"交易所 {exchange_id} 初始化成功（超时: 30s, 连接池: {HTTP_POOL_SIZE}）")
             return exchange

@@ -17,6 +17,9 @@ from typing import List, Optional
 from datetime import datetime
 
 import ccxt
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from src.utils.analysis.kline_data_filler import KlineDataFiller
 from src.utils.core.logging_config import logger
@@ -97,18 +100,36 @@ class KlineDataFillerLazy(KlineDataFiller):
             return None
 
         try:
+            # ⭐ 修复: 创建自定义 requests.Session 对象配置连接池
+            session = requests.Session()
+
+            # 配置重试策略
+            retry_strategy = Retry(
+                total=HTTP_POOL_MAX_RETRIES,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"]
+            )
+
+            # 创建 HTTP 适配器并配置连接池
+            adapter = HTTPAdapter(
+                pool_connections=HTTP_POOL_CONNECTIONS,
+                pool_maxsize=HTTP_POOL_SIZE,
+                max_retries=retry_strategy,
+                pool_block=HTTP_POOL_BLOCK
+            )
+
+            # 挂载适配器到 session（http 和 https）
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+
+            # 初始化 CCXT 交易所
             exchange_class = getattr(ccxt, exchange_id)
             exchange = exchange_class({
                 'enableRateLimit': True,
                 'rateLimit': KLINE_FILLER_LAZY_RATE_LIMIT,
                 'timeout': KLINE_FILLER_LAZY_TIMEOUT_MS,
-                # ⭐ 修复: 配置连接池避免 "Connection pool is full" 警告
-                'session': {
-                    'pool_maxsize': HTTP_POOL_SIZE,           # 连接池最大连接数(10 → 50)
-                    'pool_connections': HTTP_POOL_CONNECTIONS, # 连接池数量
-                    'max_retries': HTTP_POOL_MAX_RETRIES,     # 最大重试次数
-                    'pool_block': HTTP_POOL_BLOCK              # 池满时不阻塞
-                }
+                'session': session  # 传递配置好的 session 对象
             })
             # ✅ 不调用 load_markets()，瞬间完成
             logger.info(f"交易所 {exchange_id} 轻量级初始化完成（连接池: {HTTP_POOL_SIZE}）")
