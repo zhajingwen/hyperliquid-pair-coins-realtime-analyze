@@ -42,8 +42,6 @@ CREATE TABLE IF NOT EXISTS symbol_metadata (
     base_asset VARCHAR(20) NOT NULL,
     quote_asset VARCHAR(20) NOT NULL,
     listing_time TIMESTAMPTZ,
-    first_kline_time TIMESTAMPTZ,
-    last_kline_time TIMESTAMPTZ,
     is_active BOOLEAN DEFAULT TRUE,
     data_quality_score DOUBLE PRECISION DEFAULT 0.0,
     total_klines BIGINT DEFAULT 0,
