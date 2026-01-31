@@ -135,6 +135,12 @@ KLINE_FILLER_CLEANUP_INTERVAL = 100  # 清理间隔(次)
 KLINE_FILLER_LAZY_RATE_LIMIT = 1500  # Lazy模式速率限制(ms)
 KLINE_FILLER_LAZY_TIMEOUT_MS = 30000  # Lazy模式超时(ms)
 
+# ============ HTTP连接池配置 ============
+HTTP_POOL_SIZE = 50  # 连接池大小(默认10 → 50,适应多线程并发)
+HTTP_POOL_CONNECTIONS = 50  # 连接池数量
+HTTP_POOL_MAX_RETRIES = 3  # 最大重试次数
+HTTP_POOL_BLOCK = False  # 池满时不阻塞,创建新连接
+
 # ============ 飞书告警高级配置 ============
 LARK_MAX_RETRIES = 3  # 最大重试次数
 LARK_REQUEST_TIMEOUT = 10.0  # 请求超时(秒)

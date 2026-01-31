@@ -20,7 +20,14 @@ import ccxt
 
 from src.utils.analysis.kline_data_filler import KlineDataFiller
 from src.utils.core.logging_config import logger
-from src.utils.core.config import KLINE_FILLER_LAZY_RATE_LIMIT, KLINE_FILLER_LAZY_TIMEOUT_MS
+from src.utils.core.config import (
+    KLINE_FILLER_LAZY_RATE_LIMIT,
+    KLINE_FILLER_LAZY_TIMEOUT_MS,
+    HTTP_POOL_SIZE,
+    HTTP_POOL_CONNECTIONS,
+    HTTP_POOL_MAX_RETRIES,
+    HTTP_POOL_BLOCK
+)
 
 
 class KlineDataFillerLazy(KlineDataFiller):
@@ -73,31 +80,38 @@ class KlineDataFillerLazy(KlineDataFiller):
     def _init_exchange(self, exchange_id: str) -> ccxt.Exchange:
         """
         轻量级交易所初始化（延迟加载模式）
-        
+
         说明：
         - 父类 __init__ 调用时：通过 _skip_parent_init 标志跳过，返回 None
         - 延迟加载调用时：创建交易所实例，不调用 load_markets() 以提升速度
         - 设置更长的超时时间（30秒）以适应网络环境
-        
+
         Args:
             exchange_id: 交易所ID
-            
+
         Returns:
             ccxt.Exchange: 交易所实例（父类调用时返回 None）
         """
         # 如果是父类 __init__ 调用的，跳过初始化
         if hasattr(self, '_skip_parent_init') and self._skip_parent_init:
             return None
-            
+
         try:
             exchange_class = getattr(ccxt, exchange_id)
             exchange = exchange_class({
                 'enableRateLimit': True,
                 'rateLimit': KLINE_FILLER_LAZY_RATE_LIMIT,
                 'timeout': KLINE_FILLER_LAZY_TIMEOUT_MS,
+                # ⭐ 修复: 配置连接池避免 "Connection pool is full" 警告
+                'session': {
+                    'pool_maxsize': HTTP_POOL_SIZE,           # 连接池最大连接数(10 → 50)
+                    'pool_connections': HTTP_POOL_CONNECTIONS, # 连接池数量
+                    'max_retries': HTTP_POOL_MAX_RETRIES,     # 最大重试次数
+                    'pool_block': HTTP_POOL_BLOCK              # 池满时不阻塞
+                }
             })
             # ✅ 不调用 load_markets()，瞬间完成
-            logger.info(f"交易所 {exchange_id} 轻量级初始化完成")
+            logger.info(f"交易所 {exchange_id} 轻量级初始化完成（连接池: {HTTP_POOL_SIZE}）")
             return exchange
         except Exception as e:
             logger.error(f"交易所初始化失败: {e}")

@@ -30,7 +30,11 @@ from src.utils.core.config import (
     KLINE_FILLER_API_INTERVAL,
     KLINE_FILLER_MAX_RETRIES,
     KLINE_FILLER_API_LIMIT,
-    KLINE_FILLER_CLEANUP_INTERVAL
+    KLINE_FILLER_CLEANUP_INTERVAL,
+    HTTP_POOL_SIZE,
+    HTTP_POOL_CONNECTIONS,
+    HTTP_POOL_MAX_RETRIES,
+    HTTP_POOL_BLOCK
 )
 
 
@@ -117,9 +121,16 @@ class KlineDataFiller:
                 'options': {
                     'defaultType': 'swap',
                     'recvWindow': 60000,  # 接收窗口60秒
+                },
+                # ⭐ 修复: 配置连接池避免 "Connection pool is full" 警告
+                'session': {
+                    'pool_maxsize': HTTP_POOL_SIZE,           # 连接池最大连接数(10 → 50)
+                    'pool_connections': HTTP_POOL_CONNECTIONS, # 连接池数量
+                    'max_retries': HTTP_POOL_MAX_RETRIES,     # 最大重试次数
+                    'pool_block': HTTP_POOL_BLOCK              # 池满时不阻塞
                 }
             })
-            logger.info(f"交易所 {exchange_id} 初始化成功（超时: 30s）")
+            logger.info(f"交易所 {exchange_id} 初始化成功（超时: 30s, 连接池: {HTTP_POOL_SIZE}）")
             return exchange
         except Exception as e:
             logger.error(f"交易所初始化失败: {e}")
