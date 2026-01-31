@@ -9,6 +9,8 @@ lark_alert_email: str = os.getenv('LARK_ALERT_EMAIL', '')
 redis_password: Optional[str] = os.getenv('REDIS_PASSWORD')
 TIMESCALEDB_USER: str = os.getenv('TIMESCALEDB_USER', 'postgres')
 TIMESCALEDB_PASSWORD: str = os.getenv('TIMESCALEDB_PASSWORD', 'postgres')
+TIMESCALEDB_HOST = os.getenv('TIMESCALEDB_HOST', '127.0.0.1')
+TIMESCALEDB_PORT = int(os.getenv('TIMESCALEDB_PORT', 5432))
 
 # ============ 环境配置 ============
 env = 'local'
@@ -17,8 +19,8 @@ env = 'local'
 redis_host = '127.0.0.1'
 
 # ============ TimescaleDB配置 ============
-TIMESCALEDB_HOST = '127.0.0.1'
-TIMESCALEDB_PORT = 5432
+# TIMESCALEDB_HOST = '127.0.0.1'
+# TIMESCALEDB_PORT = 5432
 TIMESCALEDB_NAME = 'crypto_data'
 TIMESCALEDB_POOL_MIN_SIZE = 5
 TIMESCALEDB_POOL_MAX_SIZE = 30
