@@ -37,7 +37,7 @@ services:
     expose:
       # PostgreSQL 主端口
       - port: 5432
-        as: 5432
+        as: 80
         to:
           - global: true  # ⚠️ 暴露到公网，仅测试环境使用
 
@@ -47,8 +47,6 @@ services:
         # accept:
         #   - <your-allowed-ip>  # IP 白名单
 
-    # ⚠️ Akash 不支持 healthcheck，依赖容器自身健康检查
-
 # =====================================================
 # 资源配置 Profiles
 # =====================================================
@@ -56,30 +54,15 @@ profiles:
   compute:
     timescaledb:
       resources:
-        # CPU 配置
         cpu:
-          units: 0.5  # 2 CPU 核心
-          # attributes:
-          #   arch: amd64  # 指定 CPU 架构（可选）
-
-        # 内存配置
+          units: 0.5
         memory:
-          size: 2Gi  # 4GB 内存
-
-        # 存储配置
+          size: 1.5Gi
         storage:
-          # ⚠️ 关键配置：临时存储
-          - size: 5Gi  # 20GB 存储空间
-            # 临时存储（默认）- 容器重启数据丢失
-            # 如需持久化（beta 功能，不稳定）：
-            # attributes:
-            #   persistent: true
-            #   class: beta3
-
-          # 可选：添加额外存储用于备份
-          # - size: 10Gi
-          #   mount: /var/lib/postgresql/backups
-
+          - size: 5Gi
+            attributes:
+              persistent: true
+              class: beta3
   # 部署位置配置
   placement:
     akash:
