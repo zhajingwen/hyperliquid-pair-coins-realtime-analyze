@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-BTC-ETH 4H K线回测与Z-score分析（Binance数据源）
+PURR-HYPE 4H K线回测与Z-score分析（Hyperliquid数据源）
 
 功能：
-1. 使用 CCXT Binance 获取 BTC/USDT 和 ETH/USDT 的 4H 历史K线数据
-2. 计算 ETH vs BTC 的滑动窗口 Z-score
+1. 使用 CCXT Hyperliquid 获取 HYPE/USDC 和 PURR/USDC 的 4H 历史K线数据（现货）
+2. 计算 PURR vs HYPE 的滑动窗口 Z-score
 3. 将分析结果写入 PostgreSQL analysis_results 表
 
 数据优势：
-- 最大历史范围：8.5年（vs yfinance的2年）
-- 数据质量：交易所原生数据
-- 总数据点：约18,540个（vs yfinance的4,370个）
+- 数据质量：Hyperliquid 交易所原生现货数据（USDC 本位）
+- 专注于 HYPE-PURR 配对分析
 
 Author: Claude Code
 Date: 2026-02-01
@@ -19,7 +18,7 @@ Date: 2026-02-01
 import argparse
 import sys
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
 
@@ -43,7 +42,7 @@ from src.utils.core.logging_config import logger
 # 数据获取模块
 # =====================================================
 
-def fetch_klines_from_binance(
+def fetch_klines_from_hyperliquid(
     symbol: str,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
@@ -51,10 +50,10 @@ def fetch_klines_from_binance(
     api_delay: float = 0.2
 ) -> List[Dict]:
     """
-    使用 CCXT Binance 获取指定币种的K线数据
+    使用 CCXT Hyperliquid 获取指定币种的K线数据（现货）
 
     Args:
-        symbol: Binance symbol 格式（如 'BTC/USDT', 'ETH/USDT'）
+        symbol: Hyperliquid 现货交易对格式（如 'HYPE/USDC', 'PURR/USDC'）
         start_date: 开始日期（可选，格式：'YYYY-MM-DD'）
         end_date: 结束日期（可选，默认今天）
         interval: 时间周期（默认 '4h'）
@@ -77,8 +76,8 @@ def fetch_klines_from_binance(
     logger.info(f"开始获取 {symbol} 的 {interval} K线数据...")
 
     try:
-        # 初始化 Binance 交易所
-        exchange = ccxt.binance({
+        # 初始化 Hyperliquid 交易所
+        exchange = ccxt.hyperliquid({
             'enableRateLimit': True,  # 启用内置的速率限制
         })
 
@@ -86,8 +85,8 @@ def fetch_klines_from_binance(
         if start_date:
             since = int(datetime.strptime(start_date, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() * 1000)
         else:
-            # 默认从 Binance 上线时开始（2017-08-17）
-            since = int(datetime(2017, 8, 17, tzinfo=timezone.utc).timestamp() * 1000)
+            # 默认从 2023 年开始（Hyperliquid 相关代币上线时间）
+            since = int(datetime(2023, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
 
         if end_date:
             until = int(datetime.strptime(end_date, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp() * 1000)
@@ -180,37 +179,37 @@ def fetch_klines_from_binance(
 
 
 def align_klines(
-    btc_klines: List[Dict],
-    eth_klines: List[Dict]
+    hype_klines: List[Dict],
+    purr_klines: List[Dict]
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     对齐两个币种的K线数据（确保时间戳一致）
 
     Args:
-        btc_klines: BTC K线数据
-        eth_klines: ETH K线数据
+        hype_klines: HYPE K线数据
+        purr_klines: PURR K线数据
 
     Returns:
-        (aligned_btc, aligned_eth): 对齐后的K线数据
+        (aligned_hype, aligned_purr): 对齐后的K线数据
     """
-    logger.info("开始对齐 BTC 和 ETH 的K线数据...")
+    logger.info("开始对齐 HYPE 和 PURR 的K线数据...")
 
     # 创建时间戳到K线的映射
-    btc_map = {k['time']: k for k in btc_klines}
-    eth_map = {k['time']: k for k in eth_klines}
+    hype_map = {k['time']: k for k in hype_klines}
+    purr_map = {k['time']: k for k in purr_klines}
 
     # 找到共同的时间戳
-    common_times = sorted(set(btc_map.keys()) & set(eth_map.keys()))
+    common_times = sorted(set(hype_map.keys()) & set(purr_map.keys()))
 
     # 构建对齐后的数据
-    aligned_btc = [btc_map[t] for t in common_times]
-    aligned_eth = [eth_map[t] for t in common_times]
+    aligned_hype = [hype_map[t] for t in common_times]
+    aligned_purr = [purr_map[t] for t in common_times]
 
-    logger.info(f"数据对齐完成: {len(aligned_btc)} 个时间点")
-    if aligned_btc:
-        logger.info(f"  时间范围: {aligned_btc[0]['time']} 至 {aligned_btc[-1]['time']}")
+    logger.info(f"数据对齐完成: {len(aligned_hype)} 个时间点")
+    if aligned_hype:
+        logger.info(f"  时间范围: {aligned_hype[0]['time']} 至 {aligned_hype[-1]['time']}")
 
-    return aligned_btc, aligned_eth
+    return aligned_hype, aligned_purr
 
 
 # =====================================================
@@ -302,9 +301,9 @@ def calculate_zscore_backtest(
 def determine_trading_direction(zscore: float) -> str:
     """根据 Z-score 判断交易方向"""
     if zscore > 2.0:
-        return 'short'  # ETH 相对高估，做空 ETH
+        return 'short'  # PURR 相对高估，做空 PURR
     elif zscore < -2.0:
-        return 'long'   # ETH 相对低估，做多 ETH
+        return 'long'   # PURR 相对低估，做多 PURR
     else:
         return 'none'
 
@@ -385,8 +384,8 @@ def write_results_to_db(
                         batch_data.append((
                             datetime.now(timezone.utc),          # analysis_time
                             result['kline_time'],                # kline_time
-                            'ETH/USDC:USDC',                     # symbol
-                            'BTC/USDC:USDC',                     # base_symbol
+                            'PURR/USDC:USDC',                    # symbol (合约格式)
+                            'HYPE/USDC:USDC',                    # base_symbol (合约格式)
                             zscore,                              # zscore_4h
                             None,                                # corr_4h_60d (可选)
                             result['cointegration_passed'],      # cointegration_passed
@@ -452,12 +451,12 @@ def print_statistics(results: List[Dict]):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(
-        description='BTC-ETH 4H K线回测与Z-score分析（Binance数据源）'
+        description='PURR-HYPE 4H K线回测与Z-score分析（Hyperliquid数据源）'
     )
     parser.add_argument(
         '--start-date',
         type=str,
-        help='开始日期 (格式: YYYY-MM-DD，默认: 2017-08-17)',
+        help='开始日期 (格式: YYYY-MM-DD，默认: 2023-01-01)',
         default=None
     )
     parser.add_argument(
@@ -486,46 +485,46 @@ def main():
 
     args = parser.parse_args()
 
-    logger.info("=== BTC-ETH 4H K线回测与Z-score分析（Binance数据源）===")
-    logger.info(f"开始日期: {args.start_date or '2017-08-17 (Binance上线时)'}")
+    logger.info("=== PURR-HYPE 4H K线回测与Z-score分析（Hyperliquid数据源）===")
+    logger.info(f"开始日期: {args.start_date or '2023-01-01'}")
     logger.info(f"结束日期: {args.end_date or '今天'}")
     logger.info(f"批量写入大小: {args.batch_size}")
     logger.info(f"API调用间隔: {args.api_delay}秒")
     logger.info(f"模式: {'仅计算 (不写入数据库)' if args.dry_run else '计算并写入数据库'}")
 
-    # 1. 获取 BTC 和 ETH 的 4H K线数据
-    btc_klines = fetch_klines_from_binance(
-        'BTC/USDT',
+    # 1. 获取 HYPE 和 PURR 的 4H K线数据（现货）
+    hype_klines = fetch_klines_from_hyperliquid(
+        'HYPE/USDC',
         start_date=args.start_date,
         end_date=args.end_date,
         interval='4h',
         api_delay=args.api_delay
     )
 
-    eth_klines = fetch_klines_from_binance(
-        'ETH/USDT',
+    purr_klines = fetch_klines_from_hyperliquid(
+        'PURR/USDC',
         start_date=args.start_date,
         end_date=args.end_date,
         interval='4h',
         api_delay=args.api_delay
     )
 
-    if not btc_klines or not eth_klines:
+    if not hype_klines or not purr_klines:
         logger.error("数据获取失败，程序退出")
         sys.exit(1)
 
     # 2. 数据对齐
-    aligned_btc, aligned_eth = align_klines(btc_klines, eth_klines)
+    aligned_hype, aligned_purr = align_klines(hype_klines, purr_klines)
 
-    if len(aligned_btc) < BETA_WINDOW:
+    if len(aligned_hype) < BETA_WINDOW:
         logger.error(
-            f"对齐后数据点不足 {BETA_WINDOW} 个 (当前: {len(aligned_btc)})，"
+            f"对齐后数据点不足 {BETA_WINDOW} 个 (当前: {len(aligned_hype)})，"
             f"无法进行分析"
         )
         sys.exit(1)
 
     # 3. 批量计算 Z-score
-    results = calculate_zscore_backtest(aligned_btc, aligned_eth)
+    results = calculate_zscore_backtest(aligned_hype, aligned_purr)
 
     if not results:
         logger.error("Z-score 计算失败，程序退出")
