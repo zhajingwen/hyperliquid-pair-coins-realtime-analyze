@@ -53,7 +53,7 @@ def query_eth_zscore_history(
             WHERE symbol = %s
         """
 
-        params = ['UMA/USDC:USDC']
+        params = ['ETH/USDC:USDC']
 
         # 添加时间过滤
         if days:
@@ -130,16 +130,16 @@ def format_output(results: List[Dict], output_format: str = 'table'):
         table_data = []
         for r in results:
             table_data.append([
-                r['analysis_time'].strftime('%Y-%m-%d %H:%M:%S') if r['analysis_time'] else '',
+                # r['analysis_time'].strftime('%Y-%m-%d %H:%M:%S') if r['analysis_time'] else '',
                 r['kline_time'].strftime('%Y-%m-%d %H:%M:%S') if r['kline_time'] else '',
                 r['symbol'],
-                r['base_symbol'],
+                # r['base_symbol'],
                 f"{r['zscore_4h']:.4f}" if r['zscore_4h'] is not None else '',
-                f"{r['corr_4h_60d']:.4f}" if r['corr_4h_60d'] is not None else '',
-                '✓' if r['is_anomaly'] else '',
-                r['signal_strength'] or '',
-                r['trading_direction'] or '',
-                f"{r['analysis_delay_seconds']:.2f}" if r['analysis_delay_seconds'] is not None else ''
+                # f"{r['corr_4h_60d']:.4f}" if r['corr_4h_60d'] is not None else '',
+                # '✓' if r['is_anomaly'] else '',
+                # r['signal_strength'] or '',
+                # r['trading_direction'] or '',
+                # f"{r['analysis_delay_seconds']:.2f}" if r['analysis_delay_seconds'] is not None else ''
             ])
 
         headers = ['分析时间', 'K线时间', '币种', '基准', 'Z-Score 4H', '相关系数 4H', '异常', '信号强度', '交易方向', '延迟(秒)']
