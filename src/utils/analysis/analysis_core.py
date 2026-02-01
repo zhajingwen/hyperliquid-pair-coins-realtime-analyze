@@ -964,7 +964,7 @@ def analyze_multi_period(
         logger.info(
             f"❌ {log_prefix}多周期验证失败 | 原因: Z-score阈值不足 | "
             f"协整: {cointegration_count}/6 | "
-            f"Z-score: 5m={abs(zscore_5m):.2f}({status_5m}), 1h={abs(zscore_1h):.2f}({status_1h}), 4h={abs(zscore_4h):.2f}({status_4h}) | "
+            f"Z-score: 5m={zscore_5m:.2f}({status_5m}), 1h={zscore_1h:.2f}({status_1h}), 4h={zscore_4h:.2f}({status_4h}) | "
             f"阈值: 5m>{short_threshold}, 1h>{middle_threshold}, 4h>{long_threshold} | "
             f"{get_health_status_summary(details)}"
         )
