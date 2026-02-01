@@ -3,9 +3,11 @@
 查询ETH的zscore_4h历史数据
 
 用法:
-    python query_eth_zscore.py [--limit 100] [--days 7] [--output csv|json|table]
+    python query_eth_zscore.py [--limit N] [--days 7] [--output csv|json|table]
     python query_eth_zscore.py --year 2020 [--output csv|json|table]
     python query_eth_zscore.py --start-date 2020-01-01 --end-date 2020-12-31
+
+注意: 默认不限制返回记录数，如需限制请使用 --limit 参数
 """
 
 import sys
@@ -73,16 +75,16 @@ def query_eth_zscore_history(
             query += " AND kline_time >= %s AND kline_time < %s"
             # 结束日期加1天，确保包含结束日期当天的所有数据
             end_dt = datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)
-            params.extend([start_date, end_dt.strftime('%Y-%m-%d')])
+            params.extend([f"{start_date} 00:00:00", end_dt.strftime('%Y-%m-%d %H:%M:%S')])
         elif start_date:
             # 只有开始日期
             query += " AND kline_time >= %s"
-            params.append(start_date)
+            params.append(f"{start_date} 00:00:00")
         elif end_date:
             # 只有结束日期
             end_dt = datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)
             query += " AND kline_time < %s"
-            params.append(end_dt.strftime('%Y-%m-%d'))
+            params.append(end_dt.strftime('%Y-%m-%d %H:%M:%S'))
         elif days:
             # 使用字符串格式化，因为INTERVAL不支持参数化单位
             query += f" AND kline_time >= NOW() - INTERVAL '{days} days'"
@@ -193,14 +195,13 @@ def format_output(results: List[Dict], output_format: str = 'table'):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='查询ETH的zscore_4h历史数据')
-    parser.add_argument('--limit', type=int, default=100, help='限制返回记录数 (默认: 100)')
+    parser.add_argument('--limit', type=int, default=None, help='限制返回记录数 (默认: 无限制)')
     parser.add_argument('--days', type=int, help='查询最近N天的数据')
     parser.add_argument('--year', type=int, help='查询指定年份的数据 (例如: 2020)')
     parser.add_argument('--start-date', type=str, help='开始日期 (格式: YYYY-MM-DD)')
     parser.add_argument('--end-date', type=str, help='结束日期 (格式: YYYY-MM-DD)')
     parser.add_argument('--output', choices=['table', 'csv', 'json'], default='table',
                         help='输出格式 (默认: table)')
-    parser.add_argument('--all', action='store_true', help='查询所有数据（忽略limit限制）')
 
     args = parser.parse_args()
 
@@ -227,9 +228,8 @@ def main():
 
     try:
         # 查询数据
-        limit = None if args.all else args.limit
         results = query_eth_zscore_history(
-            limit=limit,
+            limit=args.limit,
             days=args.days,
             start_date=args.start_date,
             end_date=args.end_date,

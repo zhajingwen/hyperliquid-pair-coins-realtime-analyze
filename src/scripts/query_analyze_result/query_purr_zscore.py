@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-查询ETH的zscore_4h历史数据
+查询PURR的zscore_4h历史数据
 
 用法:
-    python query_eth_zscore.py [--limit 100] [--days 7] [--output csv|json|table]
+    python query_purr_zscore.py [--limit N] [--days 7] [--output csv|json|table]
+
+注意: 默认不限制返回记录数，如需限制请使用 --limit 参数
 """
 
 import sys
@@ -22,7 +24,7 @@ def query_eth_zscore_history(
     output_format: str = 'table'
 ) -> List[Dict]:
     """
-    查询ETH的zscore_4h历史数据
+    查询PURR的zscore_4h历史数据
 
     Args:
         limit: 限制返回记录数
@@ -69,11 +71,11 @@ def query_eth_zscore_history(
             params.append(limit)
 
         # 执行查询
-        logger.info(f"查询ETH的zscore_4h历史数据 (limit={limit}, days={days})")
+        logger.info(f"查询PURR的zscore_4h历史数据 (limit={limit}, days={days})")
         results = client.execute_query(query, tuple(params))
 
         if not results:
-            logger.warning("未找到ETH的分析结果数据")
+            logger.warning("未找到PURR的分析结果数据")
             return []
 
         logger.info(f"成功查询到 {len(results)} 条记录")
@@ -164,19 +166,17 @@ def format_output(results: List[Dict], output_format: str = 'table'):
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='查询ETH的zscore_4h历史数据')
-    parser.add_argument('--limit', type=int, default=100, help='限制返回记录数 (默认: 100)')
+    parser = argparse.ArgumentParser(description='查询PURR的zscore_4h历史数据')
+    parser.add_argument('--limit', type=int, default=None, help='限制返回记录数 (默认: 无限制)')
     parser.add_argument('--days', type=int, help='查询最近N天的数据')
     parser.add_argument('--output', choices=['table', 'csv', 'json'], default='table',
                         help='输出格式 (默认: table)')
-    parser.add_argument('--all', action='store_true', help='查询所有数据（忽略limit限制）')
 
     args = parser.parse_args()
 
     try:
         # 查询数据
-        limit = None if args.all else args.limit
-        results = query_eth_zscore_history(limit=limit, days=args.days, output_format=args.output)
+        results = query_eth_zscore_history(limit=args.limit, days=args.days, output_format=args.output)
 
         # 格式化输出
         format_output(results, args.output)
