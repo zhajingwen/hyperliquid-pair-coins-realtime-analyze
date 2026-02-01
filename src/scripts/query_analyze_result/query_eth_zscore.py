@@ -57,8 +57,8 @@ def query_eth_zscore_history(
 
         # 添加时间过滤
         if days:
-            query += " AND analysis_time >= NOW() - INTERVAL '%s days'"
-            params.append(days)
+            # 使用字符串格式化，因为INTERVAL不支持参数化单位
+            query += f" AND kline_time >= NOW() - INTERVAL '{days} days'"
 
         # 添加排序 - 按zscore绝对值升序
         query += " ORDER BY ABS(zscore_4h) ASC"
@@ -96,13 +96,20 @@ def format_output(results: List[Dict], output_format: str = 'table'):
         print("没有查询到数据")
         return
 
+    # 转换时间到本地时区的辅助函数
+    def to_local_time(dt):
+        """将 UTC 时间转换为本地时间"""
+        if dt is None:
+            return None
+        return dt.astimezone()
+
     if output_format == 'json':
         # JSON格式输出
         output = []
         for r in results:
             output.append({
-                'analysis_time': r['analysis_time'].isoformat() if r['analysis_time'] else None,
-                'kline_time': r['kline_time'].isoformat() if r['kline_time'] else None,
+                'analysis_time': to_local_time(r['analysis_time']).isoformat() if r['analysis_time'] else None,
+                'kline_time': to_local_time(r['kline_time']).isoformat() if r['kline_time'] else None,
                 'symbol': r['symbol'],
                 'base_symbol': r['base_symbol'],
                 'zscore_4h': r['zscore_4h'],
@@ -118,7 +125,9 @@ def format_output(results: List[Dict], output_format: str = 'table'):
         # CSV格式输出
         print("analysis_time,kline_time,symbol,base_symbol,zscore_4h,corr_4h_60d,is_anomaly,signal_strength,trading_direction,analysis_delay_seconds")
         for r in results:
-            print(f"{r['analysis_time']},{r['kline_time']},{r['symbol']},{r['base_symbol']},"
+            analysis_time_local = to_local_time(r['analysis_time'])
+            kline_time_local = to_local_time(r['kline_time'])
+            print(f"{analysis_time_local},{kline_time_local},{r['symbol']},{r['base_symbol']},"
                   f"{r['zscore_4h']},{r['corr_4h_60d']},{r['is_anomaly']},"
                   f"{r['signal_strength']},{r['trading_direction']},{r['analysis_delay_seconds']}")
 
@@ -129,20 +138,14 @@ def format_output(results: List[Dict], output_format: str = 'table'):
         # 准备表格数据
         table_data = []
         for r in results:
+            kline_time_local = to_local_time(r['kline_time'])
             table_data.append([
-                # r['analysis_time'].strftime('%Y-%m-%d %H:%M:%S') if r['analysis_time'] else '',
-                r['kline_time'].strftime('%Y-%m-%d %H:%M:%S') if r['kline_time'] else '',
+                kline_time_local.strftime('%Y-%m-%d %H:%M:%S') if kline_time_local else '',
                 r['symbol'],
-                # r['base_symbol'],
                 f"{r['zscore_4h']:.4f}" if r['zscore_4h'] is not None else '',
-                # f"{r['corr_4h_60d']:.4f}" if r['corr_4h_60d'] is not None else '',
-                # '✓' if r['is_anomaly'] else '',
-                # r['signal_strength'] or '',
-                # r['trading_direction'] or '',
-                # f"{r['analysis_delay_seconds']:.2f}" if r['analysis_delay_seconds'] is not None else ''
             ])
 
-        headers = ['分析时间', 'K线时间', '币种', '基准', 'Z-Score 4H', '相关系数 4H', '异常', '信号强度', '交易方向', '延迟(秒)']
+        headers = ['K线时间', '币种', 'Z-Score 4H']
         print(tabulate(table_data, headers=headers, tablefmt='grid'))
 
         # 统计信息
