@@ -442,7 +442,7 @@ class KlineRepository:
                     inserted_count = cur.rowcount
                     conn.commit()
 
-                    logger.info(f"K线批量写入成功: {inserted_count} 条记录")
+                    logger.debug(f"K线批量写入成功: {inserted_count} 条记录")
                     return inserted_count
 
         except Exception as e:
