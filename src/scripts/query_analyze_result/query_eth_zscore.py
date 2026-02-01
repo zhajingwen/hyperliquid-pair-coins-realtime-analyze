@@ -60,8 +60,8 @@ def query_eth_zscore_history(
             query += " AND analysis_time >= NOW() - INTERVAL '%s days'"
             params.append(days)
 
-        # 添加排序
-        query += " ORDER BY analysis_time DESC"
+        # 添加排序 - 按zscore绝对值升序
+        query += " ORDER BY ABS(zscore_4h) ASC"
 
         # 添加限制
         if limit:
