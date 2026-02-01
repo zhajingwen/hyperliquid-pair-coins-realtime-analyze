@@ -52,7 +52,6 @@ from src.utils.core.config import (
     BETA_WINDOW,
     ZSCORE_WINDOW,
     COINTEGRATION_THRESHOLD,
-    ZSCORE_THRESHOLDS,
     # 去重配置
     ENQUEUE_DEDUP_WINDOWS,
     DEDUP_WINDOWS,
@@ -1113,7 +1112,7 @@ class RealtimeKlineServiceBase(ABC):
                 )
                 return
 
-            # 调用多周期验证
+            # 调用多周期验证（Z-score验证）
             multi_period_result = analyze_multi_period(
                 price_data_cache=price_data_cache,
                 base_symbol=self.base_symbol,
@@ -1121,7 +1120,6 @@ class RealtimeKlineServiceBase(ABC):
                 beta_window=BETA_WINDOW,
                 zscore_window=ZSCORE_WINDOW,
                 cointegration_threshold=COINTEGRATION_THRESHOLD,
-                zscore_thresholds=ZSCORE_THRESHOLDS
             )
 
             self.stats['analyses_performed'] += 1
@@ -1133,51 +1131,30 @@ class RealtimeKlineServiceBase(ABC):
                 )
                 return
 
-            # 记录验证状态（用于日志和告警判断）
-            validation_passed = multi_period_result.get('passed', False)
-            fail_reason = multi_period_result.get('fail_reason', 'unknown') if not validation_passed else None
-
-            # 健康状态约束检查（仅用于告警判断，不影响数据库写入）
-            health_state_passed = True
-            health_state_reason = ""
-
-            try:
-                details_4h_60d = multi_period_result.get('details', {}).get(('4h', '60d'), {})
-                health_monitor = details_4h_60d.get('health_monitor')
-
-                if health_monitor is None:
-                    self.logger.warning(
-                        f"健康监控数据不存在: {symbol} @ {timeframe} | "
-                        f"跳过健康状态检查（向后兼容模式）"
-                    )
-                else:
-                    short_window = health_monitor.get('short_window', {})
-                    short_state = short_window.get('state', 'UNKNOWN')
-                    short_score = short_window.get('health_score', 0)
-
-                    if short_state != 'HEALTHY':
-                        health_state_passed = False
-                        health_state_reason = (
-                            f"短期窗口(100期)状态: {short_state} (得分: {short_score:.1f}) | "
-                            f"需要: HEALTHY (得分 >= 18)"
-                        )
-
-            except Exception as e:
-                self.logger.error(
-                    f"健康状态检查异常: {symbol} @ {timeframe} | {e}",
-                    exc_info=True
-                )
-
-            # 注意：不再 return，继续执行写入逻辑
-
             # 构建分析记录（无论验证是否通过）
             details = multi_period_result.get('details', {})
-            corr_5m_7d = details.get(('5m', '7d'), {}).get('correlation')
-            corr_1h_30d = details.get(('1h', '30d'), {}).get('correlation')
-            corr_4h_60d = details.get(('4h', '60d'), {}).get('correlation')
+            detail_5m = details.get(('5m', '7d'), {})
+            detail_1h = details.get(('1h', '30d'), {})
+            detail_4h = details.get(('4h', '60d'), {})
+
+            corr_5m_7d = detail_5m.get('correlation')
+            corr_1h_30d = detail_1h.get('correlation')
+            corr_4h_60d = detail_4h.get('correlation')
+
+            # 提取 ADF p-value (优先使用双窗口方法,回退到全量方法)
+            coint_new_4h = detail_4h.get('cointegration_new', {})
+            coint_old_4h = detail_4h.get('cointegration_old', {})
+            adf_pvalue = coint_new_4h.get('adf_pvalue') or coint_old_4h.get('adf_pvalue')
+
+            # 提取信号强度 (使用4h长周期作为主要参考)
+            signal_strength = detail_4h.get('signal_strength', 'none')
 
             analysis_now = datetime.now(timezone.utc)
             delay_seconds = (analysis_now - kline_time).total_seconds() if kline_time else 0
+
+            # 记录验证状态（用于日志和告警判断）
+            validation_passed = multi_period_result.get('passed', False)
+            fail_reason = multi_period_result.get('fail_reason', '健康')
 
             analysis_record = {
                 'kline_time': kline_time,
@@ -1191,11 +1168,11 @@ class RealtimeKlineServiceBase(ABC):
                 'zscore_5m': multi_period_result['zscore_list'][0],
                 'zscore_1h': multi_period_result['zscore_list'][1],
                 'zscore_4h': multi_period_result['zscore_list'][2],
-                'cointegration_passed': multi_period_result['cointegration_count'] >= 2,
-                'adf_pvalue': None,
-                'is_anomaly': True,
+                'cointegration_passed': multi_period_result['cointegration_count'] >= COINTEGRATION_THRESHOLD,
+                'adf_pvalue': adf_pvalue,
+                'is_anomaly': validation_passed,
                 'trading_direction': multi_period_result['direction'],
-                'signal_strength': 'strong',
+                'signal_strength': signal_strength,
             }
 
             # 批量缓冲写入（无论验证是否通过，只要有 Z-score 就写入）
@@ -1203,7 +1180,7 @@ class RealtimeKlineServiceBase(ABC):
                 self.analysis_result_buffer.put_nowait(analysis_record)
                 self.logger.debug(
                     f"分析结果已写入缓冲 | {symbol} @ {timeframe} | "
-                    f"验证通过: {validation_passed} | 健康状态: {health_state_passed}"
+                    f"验证通过: {validation_passed}"
                 )
             except queue.Full:
                 queue_size = self.analysis_result_buffer.qsize()
@@ -1216,7 +1193,7 @@ class RealtimeKlineServiceBase(ABC):
                 self.stats['analysis_result_buffer_drops'] += 1
 
             # 仅在所有验证通过时发送飞书告警
-            if validation_passed and health_state_passed:
+            if validation_passed:
                 self._send_alert(symbol, timeframe, multi_period_result)
                 elapsed = time.time() - start_time
                 self.logger.info(f"✅ 多周期验证通过: {symbol} @ {timeframe} | {elapsed:.2f}秒")
@@ -1224,8 +1201,7 @@ class RealtimeKlineServiceBase(ABC):
                 elapsed = time.time() - start_time
                 self.logger.info(
                     f"⚠️ 多周期验证未通过（但Z-score已记录）: {symbol} @ {timeframe} | "
-                    f"原因: {fail_reason if not validation_passed else health_state_reason} | "
-                    f"验证: {validation_passed} | 健康: {health_state_passed} | {elapsed:.2f}秒"
+                    f"原因: {fail_reason} | {elapsed:.2f}秒"
                 )
 
             # 性能监控

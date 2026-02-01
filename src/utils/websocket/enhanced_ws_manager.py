@@ -500,27 +500,44 @@ class EnhancedWebSocketManager:
     # =====================================================
 
     def _is_connected(self) -> bool:
-        """检查 WebSocket 是否已连接（原生实现）"""
+        """检查 WebSocket 是否已连接（增强版）"""
         try:
             if not self.ws:
+                logger.debug("连接检查失败: WebSocket 对象为 None")
                 return False
 
             # 检查 WebSocket 运行状态
             if not self.ws.keep_running:
+                logger.debug("连接检查失败: keep_running=False")
                 return False
 
             # 检查就绪标志
             if not self.ws_ready_event.is_set():
+                logger.debug("连接检查失败: 就绪标志未设置")
                 return False
 
             # 检查 WebSocket 线程存活
             if not self.ws_thread or not self.ws_thread.is_alive():
+                logger.debug("连接检查失败: WebSocket 线程未存活")
                 return False
 
+            # 🆕 检查 5: socket 状态（关键！）
+            try:
+                if hasattr(self.ws, 'sock') and self.ws.sock:
+                    # socket 关闭时 fileno() 会抛异常
+                    self.ws.sock.fileno()
+                else:
+                    logger.debug("连接检查失败: socket 为 None")
+                    return False
+            except Exception as sock_error:
+                logger.debug(f"连接检查失败: socket 已关闭 - {sock_error}")
+                return False
+
+            logger.debug("连接检查通过")
             return True
 
         except Exception as e:
-            logger.error(f"连接状态检查失败: {e}")
+            logger.warning(f"连接检查异常: {e}")
             return False
 
     def _wrapped_callback(self, msg: Dict):
@@ -604,6 +621,21 @@ class EnhancedWebSocketManager:
         # 获取待订阅列表
         with self.subscriptions_lock:
             subscriptions_to_use = list(self.subscriptions)
+
+        # 🆕 保底清理: 尝试取消可能存在的旧订阅
+        logger.debug(f"保底清理: 尝试取消 {len(subscriptions_to_use)} 个可能存在的旧订阅...")
+        for subscription in subscriptions_to_use:
+            try:
+                msg = {"method": "unsubscribe", "subscription": subscription}
+                ws.send(json.dumps(msg))
+            except Exception as e:
+                logger.debug(f"取消旧订阅失败（正常）: {e}")
+
+        # 给服务器处理时间
+        time.sleep(0.2)
+
+        # 清空并重建订阅状态
+        with self.subscriptions_lock:
             self.active_subscriptions.clear()
 
         # ⭐ 修复: 批量订阅,避免瞬时大量请求
@@ -713,32 +745,84 @@ class EnhancedWebSocketManager:
 
     def _force_cleanup_connection(self):
         """
-        强制清理WebSocket连接（原生实现，5步确定性清理）
+        强制清理WebSocket连接（三层清理策略）
 
         清理步骤:
-        1. 停止WebSocket运行循环
-        2. 停止 Ping 线程
-        3. 关闭 WebSocket 连接
-        4. 等待 WebSocket 线程退出
-        5. 清除引用确保GC回收
+        第一层: 应用层取消订阅 - 清理服务器端订阅状态
+        第二层: TCP层强制断开 - 发送 TCP RST 确保服务器清理
+        第三层: 线程清理 - 清理本地资源和引用
 
         设计原则:
         - 每步独立try-except，互不影响
         - 详细日志记录每步清理状态（可观测性）
         - 部分失败不阻塞重连（异常容忍）
         """
-        logger.info("开始强制清理WebSocket连接...")
+        logger.info("开始强制清理WebSocket连接（三层清理策略）...")
         cleanup_status = []
 
+        # 第一层: 应用层取消订阅
+        try:
+            if self.ws and self.ws_ready_event.is_set():
+                with self.subscriptions_lock:
+                    sub_count = len(self.active_subscriptions)
+                    if sub_count > 0:
+                        logger.debug(f"第1层: 尝试取消 {sub_count} 个活跃订阅...")
+                        for sub_key in list(self.active_subscriptions):
+                            try:
+                                subscription = {
+                                    'type': sub_key[0],
+                                    'coin': sub_key[1],
+                                    'interval': sub_key[2]
+                                }
+                                msg = {"method": "unsubscribe", "subscription": subscription}
+                                self.ws.send(json.dumps(msg))
+                            except Exception as e:
+                                logger.debug(f"取消订阅失败（可忽略）: {e}")
+
+                        # 给服务器处理时间
+                        time.sleep(0.2)
+                        cleanup_status.append(f"✅ 第1层: 已发送 {sub_count} 个取消订阅消息")
+                    else:
+                        cleanup_status.append("⏭️ 第1层: 无活跃订阅")
+            else:
+                cleanup_status.append("⏭️ 第1层: WebSocket 未就绪，跳过取消订阅")
+        except Exception as e:
+            cleanup_status.append(f"❌ 第1层: {e}")
+            logger.warning(f"应用层取消订阅失败: {e}")
+
+        # 第二层: TCP层强制断开（发送 TCP RST）
+        try:
+            if self.ws and hasattr(self.ws, 'sock') and self.ws.sock:
+                import struct
+                # 设置 SO_LINGER = {1, 0} 使 close() 发送 TCP RST
+                self.ws.sock.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_LINGER,
+                    struct.pack('ii', 1, 0)
+                )
+                # 关闭读写
+                try:
+                    self.ws.sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass  # socket 可能已关闭
+                self.ws.sock.close()
+                cleanup_status.append("✅ 第2层: TCP RST 已发送")
+            else:
+                cleanup_status.append("⏭️ 第2层: socket 不可用")
+        except Exception as e:
+            cleanup_status.append(f"❌ 第2层: {e}")
+            logger.warning(f"TCP层强制断开失败: {e}")
+
+        # 第三层: 线程清理
         # Step 1: 停止运行循环
         try:
             if self.ws:
                 self.ws.keep_running = False
-                cleanup_status.append("✅ Step1: 停止运行循环")
+                cleanup_status.append("✅ 第3层-1: 停止运行循环")
             else:
-                cleanup_status.append("⏭️ Step1: 无 WebSocket 对象")
+                cleanup_status.append("⏭️ 第3层-1: 无 WebSocket 对象")
         except Exception as e:
-            cleanup_status.append(f"❌ Step1: {e}")
+            cleanup_status.append(f"❌ 第3层-1: {e}")
             logger.warning(f"停止运行循环失败: {e}")
 
         # Step 2: 停止 Ping 线程
@@ -747,24 +831,24 @@ class EnhancedWebSocketManager:
             if self.ping_thread and self.ping_thread.is_alive():
                 self.ping_thread.join(timeout=WS_PING_THREAD_SHUTDOWN_TIMEOUT)
                 if self.ping_thread.is_alive():
-                    cleanup_status.append(f"⚠️ Step2: ping 线程未在 {WS_PING_THREAD_SHUTDOWN_TIMEOUT} 秒内退出")
+                    cleanup_status.append(f"⚠️ 第3层-2: ping 线程未在 {WS_PING_THREAD_SHUTDOWN_TIMEOUT} 秒内退出")
                 else:
-                    cleanup_status.append("✅ Step2: ping 线程已终止")
+                    cleanup_status.append("✅ 第3层-2: ping 线程已终止")
             else:
-                cleanup_status.append("⏭️ Step2: 无活跃 ping 线程")
+                cleanup_status.append("⏭️ 第3层-2: 无活跃 ping 线程")
         except Exception as e:
-            cleanup_status.append(f"❌ Step2: {e}")
+            cleanup_status.append(f"❌ 第3层-2: {e}")
             logger.warning(f"终止 ping 线程失败: {e}")
 
-        # Step 3: 关闭 WebSocket 连接
+        # Step 3: 关闭 WebSocket 连接（如果还未关闭）
         try:
             if self.ws:
                 self.ws.close()
-                cleanup_status.append("✅ Step3: WebSocket 已关闭")
+                cleanup_status.append("✅ 第3层-3: WebSocket 已关闭")
             else:
-                cleanup_status.append("⏭️ Step3: 无 WebSocket 连接")
+                cleanup_status.append("⏭️ 第3层-3: 无 WebSocket 连接")
         except Exception as e:
-            cleanup_status.append(f"❌ Step3: {e}")
+            cleanup_status.append(f"❌ 第3层-3: {e}")
             logger.warning(f"关闭 WebSocket 失败: {e}")
 
         # Step 4: 等待 WebSocket 线程退出
@@ -772,13 +856,13 @@ class EnhancedWebSocketManager:
             if self.ws_thread and self.ws_thread.is_alive():
                 self.ws_thread.join(timeout=2.0)
                 if self.ws_thread.is_alive():
-                    cleanup_status.append("⚠️ Step4: WebSocket 线程未在 2 秒内退出")
+                    cleanup_status.append("⚠️ 第3层-4: WebSocket 线程未在 2 秒内退出")
                 else:
-                    cleanup_status.append("✅ Step4: WebSocket 线程已退出")
+                    cleanup_status.append("✅ 第3层-4: WebSocket 线程已退出")
             else:
-                cleanup_status.append("⏭️ Step4: 无活跃 WebSocket 线程")
+                cleanup_status.append("⏭️ 第3层-4: 无活跃 WebSocket 线程")
         except Exception as e:
-            cleanup_status.append(f"❌ Step4: {e}")
+            cleanup_status.append(f"❌ 第3层-4: {e}")
             logger.warning(f"等待 WebSocket 线程退出失败: {e}")
 
         # Step 5: 清除引用
@@ -786,16 +870,16 @@ class EnhancedWebSocketManager:
             self.ws = None
             self.ws_thread = None
             self.ping_thread = None
-            cleanup_status.append("✅ Step5: 引用已清除")
+            cleanup_status.append("✅ 第3层-5: 引用已清除")
         except Exception as e:
-            cleanup_status.append(f"❌ Step5: {e}")
+            cleanup_status.append(f"❌ 第3层-5: {e}")
             logger.warning(f"清除引用失败: {e}")
 
         # 等待资源释放
         time.sleep(WS_CLEANUP_DELAY)
 
         # 汇总日志
-        logger.info(f"强制清理完成: {' | '.join(cleanup_status)}")
+        logger.info(f"三层清理完成: {' | '.join(cleanup_status)}")
 
     def add_subscriptions(self, new_subscriptions: List[Dict]) -> bool:
         """

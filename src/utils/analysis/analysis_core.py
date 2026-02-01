@@ -40,7 +40,8 @@ from src.utils.core.config import (
     HEALTH_MONITOR_STATE_THRESHOLDS,
     HEALTH_MONITOR_PERIOD,
     REQUIRED_PERIODS,
-    MIN_DATA_POINTS
+    MIN_DATA_POINTS,
+    # PERIOD_TO_ZSCORE_THRESHOLD
 )
 
 
@@ -479,44 +480,6 @@ def calculate_zscore_ols(
         logger.warning(f"OLS Z-score计算失败：{type(e).__name__}: {str(e)}", exc_info=True)
         return None
 
-
-# =====================================================
-# 异常检测
-# =====================================================
-
-def detect_anomaly(
-    zscore: float,
-    threshold: float = 2.0
-) -> Tuple[bool, str]:
-    """
-    基于Z-score的异常检测
-
-    判断规则:
-    - |zscore| > threshold: 异常信号
-    - zscore > threshold: 目标币种相对高估 → 做空方向
-    - zscore < -threshold: 目标币种相对低估 → 做多方向
-
-    Args:
-        zscore: Z-score值
-        threshold: 异常阈值（默认2.0，即2倍标准差）
-
-    Returns:
-        (is_anomaly, direction): 是否异常，交易方向
-    """
-    abs_zscore = abs(zscore)
-
-    if abs_zscore < threshold:
-        return False, 'none'
-
-    # 确定交易方向
-    if zscore > threshold:
-        direction = 'short'  # 做空（目标币种高估，价格回归预期下跌）
-    else:
-        direction = 'long'   # 做多（目标币种低估，价格回归预期上涨）
-
-    return True, direction
-
-
 # =====================================================
 # 综合分析
 # =====================================================
@@ -526,7 +489,6 @@ def analyze_pair_advanced(
     alt_klines: List[Dict],
     beta_window: int = None,
     zscore_window: int = None,
-    zscore_threshold: float = 2.0,
     enable_health_monitor: bool = True,
     stats_period_key: Optional[Tuple[str, str]] = None
 ) -> Dict:
@@ -547,7 +509,6 @@ def analyze_pair_advanced(
         alt_klines: 目标币种K线数据
         beta_window: OLS回归窗口大小（默认从配置读取）
         zscore_window: Z-score计算窗口大小（默认从配置读取）
-        zscore_threshold: Z-score异常阈值（默认2.0）
         enable_health_monitor: 是否启用健康监控（默认True）
         stats_period_key: 统计周期键，如 ('4h', '60d')，用于判断是否启用健康监控
 
@@ -576,8 +537,6 @@ def analyze_pair_advanced(
                 'score_diff': float
             } or None,
             'zscore': float,
-            'is_anomaly': bool,
-            'trading_direction': str,
             'signal_strength': str
         }
     """
@@ -606,9 +565,7 @@ def analyze_pair_advanced(
             'use_alpha': False
         },
         'health_monitor': None,
-        'zscore': 0.0,
-        'is_anomaly': False,
-        'trading_direction': 'none',
+        'zscore': None,
         'signal_strength': 'none'
     }
 
@@ -686,6 +643,7 @@ def analyze_pair_advanced(
                         result_short = monitor_short.update(log_base_series, log_alt_series)
 
                         result['health_monitor'] = {
+                            'passed': result_short['state'] == 'HEALTHY',
                             'long_window': result_long,
                             'short_window': result_short,
                             'score_diff': result_long['health_score'] - result_short['health_score']
@@ -700,32 +658,27 @@ def analyze_pair_advanced(
                 except Exception as e:
                     logger.warning(f"健康监控失败：{e}")
 
-        # 5. Z-score计算（基于OLS价差）
-        if coint_new:
-            zscore = calculate_zscore_ols(
-                base_klines,
-                alt_klines,
-                window=zscore_window,
-                beta_window=beta_window,
-                cointegration_result=coint_new
-            )
-            if zscore is not None:
-                result['zscore'] = zscore
+        if not coint_new:
+            return result
 
-        # 6. 异常检测
-        is_anomaly, direction = detect_anomaly(result['zscore'], zscore_threshold)
-        result['is_anomaly'] = is_anomaly
-        result['trading_direction'] = direction
+        # 5. Z-score计算（基于OLS价差）
+        zscore = calculate_zscore_ols(
+            base_klines,
+            alt_klines,
+            window=zscore_window,
+            beta_window=beta_window,
+            cointegration_result=coint_new
+        )
+        result['zscore'] = zscore
 
         # 7. 信号强度评估
-        if is_anomaly:
-            abs_zscore = abs(result['zscore'])
-            if abs_zscore > ZSCORE_THRESHOLDS['strong']:
-                result['signal_strength'] = 'strong'
-            elif abs_zscore > ZSCORE_THRESHOLDS['medium']:
-                result['signal_strength'] = 'medium'
-            else:
-                result['signal_strength'] = 'weak'
+        abs_zscore = abs(zscore)
+        if abs_zscore > ZSCORE_THRESHOLDS['strong']:
+            result['signal_strength'] = 'strong'
+        elif abs_zscore > ZSCORE_THRESHOLDS['medium']:
+            result['signal_strength'] = 'medium'
+        else:
+            result['signal_strength'] = 'weak'
 
         return result
 
@@ -741,7 +694,6 @@ def analyze_multi_period(
     beta_window: int = None,
     zscore_window: int = None,
     cointegration_threshold: int = None,
-    zscore_thresholds: Optional[Dict[str, float]] = None
 ) -> Optional[Dict]:
     """
     多周期Z-score验证算法（提取自 multi_coins.py）
@@ -759,13 +711,6 @@ def analyze_multi_period(
         beta_window: OLS回归窗口（默认从配置读取）
         zscore_window: Z-score计算窗口（默认从配置读取）
         cointegration_threshold: 协整通过门槛（默认从配置读取）
-        zscore_thresholds: Z-score阈值字典（默认从配置读取）
-            {
-                'long': 0.2,    # 4h 长周期
-                'middle': 1.5,  # 1h 中周期
-                'short': 1.8    # 5m 短周期
-            }
-
     Returns:
         Dict: {
             'passed': bool,  # 是否通过多周期验证
@@ -802,8 +747,6 @@ def analyze_multi_period(
         zscore_window = ZSCORE_WINDOW
     if cointegration_threshold is None:
         cointegration_threshold = COINTEGRATION_THRESHOLD
-    if zscore_thresholds is None:
-        zscore_thresholds = ZSCORE_THRESHOLDS
 
     # 构建日志前缀（target_symbol vs base_symbol）
     log_prefix = ""
@@ -860,7 +803,6 @@ def analyze_multi_period(
             alt_klines=alt_klines,
             beta_window=beta_window,
             zscore_window=zscore_window,
-            zscore_threshold=2.0,  # 内部阈值，外部再验证
             enable_health_monitor=True,
             stats_period_key=period_key
         )
@@ -909,6 +851,21 @@ def analyze_multi_period(
             'fail_reason': f'cointegration_count ({cointegration_count}) < threshold ({cointegration_threshold})'
         }
 
+    # 验证2: 健康监控检查
+    health_monitor = analysis_result.get('health_monitor')
+    # 只有 ('4h', '60d')（HEALTH_MONITOR_PERIOD） 才有值
+    if health_monitor:
+        # ('4h', '60d') 健康监控 判断是否能够通过
+        if not health_monitor.get('passed'):
+            return {
+                'passed': False,
+                'zscore_list': zscore_list,
+                'cointegration_count': cointegration_count,
+                'direction': 'none',
+                'details': details,
+                'fail_reason': '4H/60D短期健康监控失败（not HEALTHY）'
+            }
+
     # 提取3个周期的Z-score
     zscore_5m, zscore_1h, zscore_4h = zscore_list
 
@@ -935,9 +892,9 @@ def analyze_multi_period(
         }
 
     # 验证3: Z-score阈值检查
-    long_threshold = zscore_thresholds['long']
-    middle_threshold = zscore_thresholds['middle']
-    short_threshold = zscore_thresholds['short']
+    long_threshold = ZSCORE_THRESHOLDS['long']
+    middle_threshold = ZSCORE_THRESHOLDS['middle']
+    short_threshold = ZSCORE_THRESHOLDS['short']
 
     if not (abs(zscore_4h) > long_threshold and
             abs(zscore_1h) > middle_threshold and

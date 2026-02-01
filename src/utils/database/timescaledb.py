@@ -210,7 +210,7 @@ class TimescaleDBClient:
                 else:
                     # 关闭污染的连接，不要放回池中
                     try:
-                        self._pool.putconn(conn, close=True)
+                        conn.close()
                         logger.warning("已从连接池移除污染的连接")
                     except Exception as close_e:
                         logger.error(f"关闭污染连接失败: {close_e}")
