@@ -1126,15 +1126,18 @@ class RealtimeKlineServiceBase(ABC):
 
             self.stats['analyses_performed'] += 1
 
-            # 验证失败，不告警
-            if multi_period_result is None or not multi_period_result.get('passed', False):
+            # Z-score 计算失败，跳过
+            if multi_period_result is None:
                 self.logger.debug(
-                    f"多周期验证未通过: {symbol} @ {timeframe} | "
-                    f"协整通过数: {multi_period_result.get('cointegration_count', 0) if multi_period_result else 0}"
+                    f"Z-score 计算失败，跳过分析: {symbol} @ {timeframe}"
                 )
                 return
 
-            # 健康状态约束检查
+            # 记录验证状态（用于日志和告警判断）
+            validation_passed = multi_period_result.get('passed', False)
+            fail_reason = multi_period_result.get('fail_reason', 'unknown') if not validation_passed else None
+
+            # 健康状态约束检查（仅用于告警判断，不影响数据库写入）
             health_state_passed = True
             health_state_reason = ""
 
@@ -1165,13 +1168,9 @@ class RealtimeKlineServiceBase(ABC):
                     exc_info=True
                 )
 
-            if not health_state_passed:
-                self.logger.info(
-                    f"协整健康约束未通过: {symbol} @ {timeframe} | {health_state_reason}"
-                )
-                return
+            # 注意：不再 return，继续执行写入逻辑
 
-            # 通过验证，构建告警记录
+            # 构建分析记录（无论验证是否通过）
             details = multi_period_result.get('details', {})
             corr_5m_7d = details.get(('5m', '7d'), {}).get('correlation')
             corr_1h_30d = details.get(('1h', '30d'), {}).get('correlation')
@@ -1199,9 +1198,13 @@ class RealtimeKlineServiceBase(ABC):
                 'signal_strength': 'strong',
             }
 
-            # 批量缓冲写入
+            # 批量缓冲写入（无论验证是否通过，只要有 Z-score 就写入）
             try:
                 self.analysis_result_buffer.put_nowait(analysis_record)
+                self.logger.debug(
+                    f"分析结果已写入缓冲 | {symbol} @ {timeframe} | "
+                    f"验证通过: {validation_passed} | 健康状态: {health_state_passed}"
+                )
             except queue.Full:
                 queue_size = self.analysis_result_buffer.qsize()
                 queue_capacity = self.analysis_result_buffer.maxsize
@@ -1212,15 +1215,22 @@ class RealtimeKlineServiceBase(ABC):
                 )
                 self.stats['analysis_result_buffer_drops'] += 1
 
-            # 发送飞书告警
-            self._send_alert(symbol, timeframe, multi_period_result)
+            # 仅在所有验证通过时发送飞书告警
+            if validation_passed and health_state_passed:
+                self._send_alert(symbol, timeframe, multi_period_result)
+                elapsed = time.time() - start_time
+                self.logger.info(f"✅ 多周期验证通过: {symbol} @ {timeframe} | {elapsed:.2f}秒")
+            else:
+                elapsed = time.time() - start_time
+                self.logger.info(
+                    f"⚠️ 多周期验证未通过（但Z-score已记录）: {symbol} @ {timeframe} | "
+                    f"原因: {fail_reason if not validation_passed else health_state_reason} | "
+                    f"验证: {validation_passed} | 健康: {health_state_passed} | {elapsed:.2f}秒"
+                )
 
             # 性能监控
-            elapsed = time.time() - start_time
             if elapsed > 15.0:
                 self.logger.warning(f"⚠️ 多周期分析延迟过高: {symbol} | {elapsed:.2f}秒")
-            else:
-                self.logger.info(f"✅ 多周期验证通过: {symbol} @ {timeframe} | {elapsed:.2f}秒")
 
         except Exception as e:
             self.logger.error(f"多周期分析失败: {symbol} @ {timeframe} | {e}", exc_info=True)
