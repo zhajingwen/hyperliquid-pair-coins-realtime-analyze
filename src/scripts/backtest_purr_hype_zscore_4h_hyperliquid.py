@@ -108,12 +108,12 @@ def fetch_klines_from_hyperliquid(
         # 分批获取数据
         all_klines = []
         current_since = since
-        limit = 1000  # Binance API 单次最大返回数量
+        limit = 1000  # Hyperliquid API 单次最大返回数量
 
         # 使用 tqdm 显示进度
         with tqdm(total=total_expected, desc=f"获取 {symbol}", unit="条") as pbar:
             while current_since < until:
-                # 调用 Binance API
+                # 调用 Hyperliquid API
                 ohlcv = exchange.fetch_ohlcv(
                     symbol=symbol,
                     timeframe=interval,
@@ -226,8 +226,8 @@ def calculate_zscore_backtest(
     批量计算滑动窗口 Z-score
 
     Args:
-        base_klines: BTC K线数据（对齐后）
-        alt_klines: ETH K线数据（对齐后）
+        base_klines: HYPE K线数据（对齐后）
+        alt_klines: PURR K线数据（对齐后）
         beta_window: OLS 回归窗口（默认 100）
         zscore_window: Z-score 统计窗口（默认 30）
 
