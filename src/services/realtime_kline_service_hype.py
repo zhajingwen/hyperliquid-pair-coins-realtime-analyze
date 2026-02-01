@@ -24,15 +24,6 @@
 - 1h/4h 推送频率极低（额外网络开销 <2%），无需本地聚合
 - Volume 与交易所原生数据完全一致，无聚合误差
 - HYPE/USDC:USDC 作为基础货币，分析 PURR 与 HYPE 的配对关系
-
-性能目标：
-- 分析延迟: <5秒
-- 告警延迟: <10秒
-- 内存占用: <512MB
-- CPU占用: <50%
-
-Author: Claude Code
-Date: 2026-01-19
 """
 
 from typing import List

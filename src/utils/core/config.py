@@ -48,8 +48,8 @@ ANALYSIS_WORKERS_GENERAL = 15
 ANALYSIS_WORKERS_HYPE = 2
 
 # ============ 去重配置 ============
-ENQUEUE_DEDUP_WINDOWS: Dict[str, int] = {'5m': 30, '1h': 180, '4h': 600}
-DEDUP_WINDOWS: Dict[str, int] = {'5m': 60, '1h': 300, '4h': 900}
+ENQUEUE_DEDUP_WINDOWS: Dict[str, int] = {'5m': 1, '1h': 180, '4h': 600}
+DEDUP_WINDOWS: Dict[str, int] = {'5m': 1, '1h': 300, '4h': 900}
 CLEANUP_INTERVAL = 300
 MAX_RECENT_TASKS = 5000
 
