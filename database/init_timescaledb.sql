@@ -176,14 +176,16 @@ SELECT add_retention_policy(
 
 \echo '✅ klines 保留策略已配置 (90天)'
 
--- analysis_results: 保留180天
-SELECT add_retention_policy(
-    'analysis_results',
-    INTERVAL '180 days',
-    if_not_exists => TRUE
-);
+-- analysis_results: 永久保留（不设置自动清理策略）
+-- 注意：数据将永久保留，需手动管理存储空间
+-- 如需恢复自动清理，取消注释以下代码：
+-- SELECT add_retention_policy(
+--     'analysis_results',
+--     INTERVAL '180 days',
+--     if_not_exists => TRUE
+-- );
 
-\echo '✅ analysis_results 保留策略已配置 (180天)'
+\echo '✅ analysis_results 永久保留（无自动清理）'
 
 -- =====================================================
 -- 6. 配置压缩策略（节省存储空间）
