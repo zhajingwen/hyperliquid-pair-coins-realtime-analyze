@@ -63,7 +63,8 @@ def query_eth_zscore_history(
             query += f" AND kline_time >= NOW() - INTERVAL '{days} days'"
 
         # 添加排序 - 按zscore绝对值升序
-        query += " ORDER BY ABS(zscore_4h) ASC"
+        # query += " ORDER BY ABS(zscore_4h) ASC"
+        query += " ORDER BY kline_time ASC"
 
         # 添加限制
         if limit:
