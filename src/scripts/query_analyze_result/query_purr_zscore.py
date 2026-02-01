@@ -134,8 +134,25 @@ def format_output(results: List[Dict], output_format: str = 'table'):
                   f"{r['signal_strength']},{r['trading_direction']},{r['analysis_delay_seconds']}")
 
     else:  # table格式
-        # 表格格式输出
-        from tabulate import tabulate
+        # 表格格式输出 - 使用中文友好的格式化
+        def get_display_width(s):
+            """计算字符串的显示宽度（中文字符占2个宽度）"""
+            width = 0
+            for char in str(s):
+                if '\u4e00' <= char <= '\u9fff':  # 中文字符范围
+                    width += 2
+                else:
+                    width += 1
+            return width
+
+        def pad_string(s, width):
+            """填充字符串到指定显示宽度"""
+            s = str(s)
+            current_width = get_display_width(s)
+            if current_width >= width:
+                return s
+            padding = width - current_width
+            return s + ' ' * padding
 
         # 准备表格数据
         table_data = []
@@ -145,10 +162,35 @@ def format_output(results: List[Dict], output_format: str = 'table'):
                 kline_time_local.strftime('%Y-%m-%d %H:%M:%S') if kline_time_local else '',
                 r['symbol'],
                 f"{r['zscore_4h']:.4f}" if r['zscore_4h'] is not None else '',
+                '是' if r['is_anomaly'] else '否',
+                r['trading_direction'] if r['trading_direction'] else 'none',
+                r['signal_strength'] if r['signal_strength'] else 'none',
             ])
 
-        headers = ['K线时间', '币种', 'Z-Score 4H']
-        print(tabulate(table_data, headers=headers, tablefmt='grid'))
+        headers = ['K线时间', '币种', 'ZScore_4H', '异常', '交易方向', '信号强度']
+
+        # 计算每列的最大宽度
+        col_widths = [get_display_width(h) for h in headers]
+        for row in table_data:
+            for i, cell in enumerate(row):
+                col_widths[i] = max(col_widths[i], get_display_width(cell))
+
+        # 打印表头分隔线
+        sep_line = '+' + '+'.join('-' * (w + 2) for w in col_widths) + '+'
+        print(sep_line)
+
+        # 打印表头
+        header_row = '| ' + ' | '.join(pad_string(h, col_widths[i]) for i, h in enumerate(headers)) + ' |'
+        print(header_row)
+        print(sep_line)
+
+        # 打印数据行
+        for row in table_data:
+            data_row = '| ' + ' | '.join(pad_string(cell, col_widths[i]) for i, cell in enumerate(row)) + ' |'
+            print(data_row)
+
+        # 打印底部分隔线
+        print(sep_line)
 
         # 统计信息
         print(f"\n总记录数: {len(results)}")
