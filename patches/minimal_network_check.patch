@@ -1,0 +1,138 @@
+# 最小化网络检测补丁
+# 应用方式：手动复制关键代码到 enhanced_ws_manager.py
+
+# ============================================================
+# 步骤 1: 在文件顶部添加导入（第 24 行后）
+# ============================================================
+
+from src.utils.websocket.network_checker import (
+    check_network_connectivity,
+    is_dns_error
+)
+
+
+# ============================================================
+# 步骤 2: 修改 _on_error 方法（约第 716 行）
+# ============================================================
+
+def _on_error(self, ws, error):
+    """WebSocket 错误回调（改进版：区分错误类型）"""
+    # 区分 DNS 错误
+    if is_dns_error(error):
+        logger.error(f"🌐 WebSocket DNS 错误: {error}")
+        logger.warning("可能原因：网络断开、DNS 服务器故障、域名配置错误")
+    else:
+        logger.error(f"WebSocket 错误: {error}")
+
+
+# ============================================================
+# 步骤 3: 在 _reconnect 方法中添加网络检测（约第 1140 行）
+# 在 try 块之前添加以下代码
+# ============================================================
+
+        # 原代码：if self.stop_event.is_set(): break
+        if self.stop_event.is_set():
+            break
+
+        # ✅ 新增：重连前检测网络（关键改进）
+        is_available, reason = check_network_connectivity(timeout=3)
+        if not is_available:
+            logger.warning(f"🌐 网络不可用: {reason}，等待 30 秒后重试")
+            self.stop_event.wait(30)  # 网络不可用时延长等待
+            continue  # 跳过本次重连，下一轮再试
+
+        logger.debug(f"✅ 网络检测通过: {reason}")
+
+        try:
+            # 原有的重连代码
+            if self.ws:
+                self._force_cleanup_connection()
+
+            self._connect()
+            logger.info("✅ WebSocket重连成功")
+            return
+
+        except Exception as e:
+            logger.error(f"重连失败 (第{retry_count}次): {e}")
+
+            # ✅ 新增：DNS 错误额外等待
+            if is_dns_error(e):
+                logger.warning("⚠️ 检测到 DNS 错误，额外等待 20 秒")
+                self.stop_event.wait(20)
+
+            # 原有的告警逻辑保持不变
+            ...
+
+
+# ============================================================
+# 完整修改后的 _reconnect 方法示例
+# ============================================================
+
+def _reconnect(self):
+    """重连逻辑（指数退避策略 + 网络检测 + 告警机制）"""
+    self._update_state(ConnectionState.RECONNECTING)
+
+    while self.reconnection_manager.should_retry() and not self.stop_event.is_set():
+        self.reconnection_manager.record_attempt()
+        delay = self.reconnection_manager.get_delay()
+        retry_count = self.reconnection_manager.retry_count
+        max_retries = self.reconnection_manager.max_retries
+
+        logger.info(
+            f"⏳ 准备重连 (第{retry_count}次"
+            f"{f'/{max_retries}' if max_retries else ''}) | "
+            f"延迟: {delay:.2f}秒"
+        )
+
+        self.stop_event.wait(delay)
+
+        if self.stop_event.is_set():
+            break
+
+        # ✅ 新增：重连前检测网络
+        is_available, reason = check_network_connectivity(timeout=3)
+        if not is_available:
+            logger.warning(f"🌐 网络不可用: {reason}，等待 30 秒后重试")
+            self.stop_event.wait(30)
+            continue
+
+        logger.debug(f"✅ 网络检测通过: {reason}")
+
+        try:
+            # 强制清理旧连接
+            if self.ws:
+                self._force_cleanup_connection()
+
+            # 重连
+            self._connect()
+            logger.info("✅ WebSocket重连成功")
+            return
+
+        except Exception as e:
+            logger.error(f"重连失败 (第{retry_count}次): {e}")
+
+            # ✅ 新增：DNS 错误额外等待
+            if is_dns_error(e):
+                logger.warning("⚠️ 检测到 DNS 错误，额外等待 20 秒")
+                self.stop_event.wait(20)
+
+            # P0-2：第N次重试时发送告警（N = alert_threshold）
+            if retry_count == self.alert_threshold and self.alert_callback:
+                try:
+                    error_type = "DNS 错误（网络问题）" if is_dns_error(e) else "连接错误"
+                    self.alert_callback(
+                        "⚠️ WebSocket连续重连失败告警",
+                        f"WebSocket已连续重连失败 {retry_count} 次\n"
+                        f"错误类型: {error_type}\n"
+                        f"最大重试次数: {max_retries or '无限'}\n"
+                        f"最近错误: {e}\n"
+                        f"服务仍在尝试重连中，请关注..."
+                    )
+                except Exception as alert_err:
+                    logger.error(f"发送重连告警失败: {alert_err}")
+
+    # 重试次数耗尽（原有代码保持不变）
+    logger.error(
+        f"🚨 重连失败: 达到最大重试次数 ({self.reconnection_manager.max_retries}次)，服务进入FAILED状态"
+    )
+    # ... 后续代码不变

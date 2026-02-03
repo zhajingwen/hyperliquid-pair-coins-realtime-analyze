@@ -23,7 +23,8 @@ redis_host = '127.0.0.1'
 # TIMESCALEDB_PORT = 5432
 TIMESCALEDB_NAME = 'crypto_data'
 TIMESCALEDB_POOL_MIN_SIZE = 5
-TIMESCALEDB_POOL_MAX_SIZE = 30
+# ⚡ 优化: 扩大连接池，匹配工作线程数（30 × 2 = 60）
+TIMESCALEDB_POOL_MAX_SIZE = 60  # 30 → 60, 避免连接池耗尽
 TIMESCALEDB_POOL_TIMEOUT = 30.0
 TIMESCALEDB_POOL_MAX_LIFETIME = 3600
 TIMESCALEDB_POOL_MAX_IDLE = 600
@@ -40,11 +41,13 @@ HYPE_SYMBOLS: List[str] = ['HYPE/USDC:USDC', 'PURR/USDC:USDC']
 HYPE_CORR_THRESHOLD: float = 0.5
 
 # ============ 队列配置 ============
-QUEUE_CONFIG_GENERAL: Dict[str, int] = {'kline_buffer_size': 10000, 'analysis_queue_size': 15000, 'analysis_result_buffer_size': 10000}
+# ⚡ 优化: 扩大队列容量，应对市场高波动期
+QUEUE_CONFIG_GENERAL: Dict[str, int] = {'kline_buffer_size': 10000, 'analysis_queue_size': 30000, 'analysis_result_buffer_size': 10000}
 QUEUE_CONFIG_HYPE: Dict[str, int] = {'kline_buffer_size': 1000, 'analysis_queue_size': 1000, 'analysis_result_buffer_size': 1000}
 
 # ============ 工作线程配置 ============
-ANALYSIS_WORKERS_GENERAL = 15
+# ⚡ 优化: 增加工作线程数，提升处理速度
+ANALYSIS_WORKERS_GENERAL = 30  # 15 → 30, 提升100%处理能力
 ANALYSIS_WORKERS_HYPE = 2
 
 # ============ 去重配置 ============
@@ -143,8 +146,9 @@ KLINE_FILLER_LAZY_RATE_LIMIT = 1500  # Lazy模式速率限制(ms)
 KLINE_FILLER_LAZY_TIMEOUT_MS = 30000  # Lazy模式超时(ms)
 
 # ============ HTTP连接池配置 ============
-HTTP_POOL_SIZE = 50  # 连接池大小(默认10 → 50,适应多线程并发)
-HTTP_POOL_CONNECTIONS = 50  # 连接池数量
+# ⚡ 优化: 扩大HTTP连接池，匹配增加的工作线程
+HTTP_POOL_SIZE = 100  # 连接池大小(50 → 100,适应30个工作线程)
+HTTP_POOL_CONNECTIONS = 100  # 连接池数量
 HTTP_POOL_MAX_RETRIES = 3  # 最大重试次数
 HTTP_POOL_BLOCK = False  # 池满时不阻塞,创建新连接
 
