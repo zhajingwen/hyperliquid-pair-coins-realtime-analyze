@@ -63,8 +63,8 @@ def query_eth_zscore_history(
             query += f" AND kline_time >= NOW() - INTERVAL '{days} days'"
 
         # 添加排序 - 按zscore绝对值升序
-        # query += " ORDER BY ABS(zscore_4h) ASC"
-        query += " ORDER BY kline_time ASC"
+        query += " ORDER BY ABS(zscore_4h) ASC"
+        # query += " ORDER BY kline_time ASC"
 
         # 添加限制
         if limit:
@@ -158,8 +158,10 @@ def format_output(results: List[Dict], output_format: str = 'table'):
         # 准备表格数据
         table_data = []
         for r in results:
+            analysis_time_local = to_local_time(r['analysis_time'])
             kline_time_local = to_local_time(r['kline_time'])
             table_data.append([
+                analysis_time_local.strftime('%Y-%m-%d %H:%M:%S') if analysis_time_local else '',
                 kline_time_local.strftime('%Y-%m-%d %H:%M:%S') if kline_time_local else '',
                 r['symbol'],
                 f"{r['zscore_4h']:.4f}" if r['zscore_4h'] is not None else '',
@@ -168,7 +170,7 @@ def format_output(results: List[Dict], output_format: str = 'table'):
                 r['signal_strength'] if r['signal_strength'] else 'none',
             ])
 
-        headers = ['K线时间', '币种', 'ZScore_4H', '异常', '交易方向', '信号强度']
+        headers = ['分析时间', 'K线时间', '币种', 'ZScore_4H', '异常', '交易方向', '信号强度']
 
         # 计算每列的最大宽度
         col_widths = [get_display_width(h) for h in headers]
