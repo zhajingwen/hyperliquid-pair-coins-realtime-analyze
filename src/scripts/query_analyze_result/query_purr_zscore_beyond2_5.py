@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-查询PURR的zscore_4h历史数据
+查询PURR的zscore_4h历史数据 (仅显示|zscore| > 2.5的异常数据)
 
 用法:
-    python query_purr_zscore.py [--limit N] [--days 7] [--output csv|json|table]
+    python query_purr_zscore_beyond2.5.py [--limit N] [--days 7] [--output csv|json|table]
 
 注意: 默认不限制返回记录数，如需限制请使用 --limit 参数
 """
@@ -12,6 +12,7 @@ import sys
 import argparse
 from datetime import datetime, timedelta
 from typing import List, Dict
+from collections import defaultdict
 import json
 
 from src.utils.database.timescaledb import TimescaleDBClient, AnalysisResultRepository
@@ -24,7 +25,7 @@ def query_eth_zscore_history(
     output_format: str = 'table'
 ) -> List[Dict]:
     """
-    查询PURR的zscore_4h历史数据
+    查询PURR的zscore_4h历史数据 (仅|zscore| > 2.5)
 
     Args:
         limit: 限制返回记录数
@@ -38,7 +39,7 @@ def query_eth_zscore_history(
         # 初始化数据库客户端
         client = TimescaleDBClient()
 
-        # 构建查询语句
+        # 构建查询语句 - 增加 zscore > 2.5 的过滤条件
         query = """
             SELECT
                 analysis_time,
@@ -53,6 +54,7 @@ def query_eth_zscore_history(
                 analysis_delay_seconds
             FROM analysis_results
             WHERE symbol = %s
+              AND ABS(zscore_4h) > 2.5
         """
 
         params = ['PURR/USDC:USDC']
@@ -72,14 +74,14 @@ def query_eth_zscore_history(
             params.append(limit)
 
         # 执行查询
-        logger.info(f"查询PURR的zscore_4h历史数据 (limit={limit}, days={days})")
+        logger.info(f"查询PURR的zscore_4h历史数据 (|zscore|>2.5, limit={limit}, days={days})")
         results = client.execute_query(query, tuple(params))
 
         if not results:
-            logger.warning("未找到PURR的分析结果数据")
+            logger.warning("未找到PURR的分析结果数据 (|zscore|>2.5)")
             return []
 
-        logger.info(f"成功查询到 {len(results)} 条记录")
+        logger.info(f"成功查询到 {len(results)} 条记录 (|zscore|>2.5)")
         return results
 
     except Exception as e:
@@ -196,22 +198,40 @@ def format_output(results: List[Dict], output_format: str = 'table'):
         print(sep_line)
 
         # 统计信息
-        print(f"\n总记录数: {len(results)}")
+        print(f"\n总记录数: {len(results)} (仅|zscore|>2.5)")
 
         # zscore_4h统计
         zscore_values = [r['zscore_4h'] for r in results if r['zscore_4h'] is not None]
         if zscore_values:
-            print(f"\nZ-Score 4H 统计:")
+            print(f"\nZ-Score 4H 统计 (|zscore|>2.5):")
             print(f"  最小值: {min(zscore_values):.4f}")
             print(f"  最大值: {max(zscore_values):.4f}")
             print(f"  平均值: {sum(zscore_values)/len(zscore_values):.4f}")
-            print(f"  异常数量 (|z|>2.5): {len([z for z in zscore_values if abs(z) > 2.5])}")
             print(f"  极端异常 (|z|>3): {len([z for z in zscore_values if abs(z) > 3])}")
+
+        # 每天异常次数统计 (按K线时间去重)
+        daily_kline_times = defaultdict(set)  # 每天的K线时间集合（用于去重）
+        for r in results:
+            kline_time_local = to_local_time(r['kline_time'])
+            if kline_time_local:
+                date_str = kline_time_local.strftime('%Y-%m-%d')
+                daily_kline_times[date_str].add(kline_time_local)
+
+        if daily_kline_times:
+            print(f"\n每日异常次数统计 (|zscore|>2.5, 按K线时间去重):")
+            print("-" * 30)
+            total_unique = 0
+            for date_str in sorted(daily_kline_times.keys()):
+                count = len(daily_kline_times[date_str])
+                total_unique += count
+                print(f"  {date_str}: {count} 次")
+            print("-" * 30)
+            print(f"  总计: {total_unique} 次 (去重后)")
 
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='查询PURR的zscore_4h历史数据')
+    parser = argparse.ArgumentParser(description='查询PURR的zscore_4h历史数据 (仅|zscore|>2.5)')
     parser.add_argument('--limit', type=int, default=None, help='限制返回记录数 (默认: 无限制)')
     parser.add_argument('--days', type=int, help='查询最近N天的数据')
     parser.add_argument('--output', choices=['table', 'csv', 'json'], default='table',
