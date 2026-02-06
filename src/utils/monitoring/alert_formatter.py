@@ -49,7 +49,8 @@ class AlertFormatter:
         timeframe: str,
         multi_period_result: Dict,
         timestamp: Optional[datetime] = None,
-        latest_alt_price: Optional[float] = None
+        latest_alt_price: Optional[float] = None,
+        avg_zscore_4h: Optional[float] = None
     ) -> str:
         """
         生成丰富格式的告警内容
@@ -61,6 +62,7 @@ class AlertFormatter:
             multi_period_result: 多周期验证结果
             timestamp: 告警时间（默认当前系统本地时间）
             latest_alt_price: 目标币种最新价格
+            avg_zscore_4h: 最近4小时4h Z-score平均值
 
         Returns:
             str: 格式化的Markdown告警内容
@@ -77,7 +79,7 @@ class AlertFormatter:
 
         # 构建各部分内容
         sections = [
-            self._format_header(symbol, base_symbol, timestamp, latest_alt_price),
+            self._format_header(symbol, base_symbol, timestamp, latest_alt_price, avg_zscore_4h),
             self._format_signal_overview(timeframe, zscore_4h, direction, cointegration_count),
             self._format_zscore_verification(zscore_5m, zscore_1h, zscore_4h),
             self._format_correlation_table(details),
@@ -89,16 +91,19 @@ class AlertFormatter:
 
         return '\n'.join(filter(None, sections))
 
-    def _format_header(self, symbol: str, base_symbol: str, timestamp: datetime, latest_alt_price: Optional[float] = None) -> str:
+    def _format_header(self, symbol: str, base_symbol: str, timestamp: datetime, latest_alt_price: Optional[float] = None, avg_zscore_4h: Optional[float] = None) -> str:
         """格式化头部信息"""
         time_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
         price_line = ""
         if latest_alt_price is not None:
             alt_name = symbol.split('/')[0]
             price_line = f"\n        **{alt_name}价格**: ${latest_alt_price:,.4f}"
+        avg_zscore_line = ""
+        if avg_zscore_4h is not None:
+            avg_zscore_line = f"\n        **近4h Z-score均值**: {avg_zscore_4h:+.4f}"
         return f"""**币种**: {symbol}
         **基准**: {base_symbol}
-        **时间**: {time_str}{price_line}
+        **时间**: {time_str}{price_line}{avg_zscore_line}
 
         ---"""
 

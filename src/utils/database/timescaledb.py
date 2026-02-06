@@ -987,6 +987,31 @@ class AnalysisResultRepository:
             (hours, limit)
         )
 
+    def query_avg_zscore_4h(self, symbol: str, hours: int = 4) -> Optional[float]:
+        """
+        查询最近N小时内的4h级别Z-score平均值
+
+        Args:
+            symbol: 币种符号
+            hours: 查询最近N小时的数据
+
+        Returns:
+            平均Z-score值，无数据时返回None
+        """
+        results = self.client.execute_query(
+            """
+            SELECT AVG(zscore_4h) as avg_zscore_4h
+            FROM analysis_results
+            WHERE symbol = %s
+                AND zscore_4h IS NOT NULL
+                AND analysis_time >= NOW() - INTERVAL '%s hours';
+            """,
+            (symbol, hours)
+        )
+        if results and results[0].get('avg_zscore_4h') is not None:
+            return float(results[0]['avg_zscore_4h'])
+        return None
+
     def get_daily_stats(
         self,
         symbol: Optional[str] = None,
