@@ -2,8 +2,6 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller
-import nolds
-
 from src.utils.core.config import (
     HEALTH_MONITOR_LONG_WINDOW,
     HEALTH_MONITOR_MAX_HALFLIFE,
@@ -267,9 +265,22 @@ class CointegrationHealthMonitor:
         trend = a + b * X
         return values - trend
 
+    @staticmethod
+    def _rs_rescaled_range(segment: np.ndarray) -> float:
+        """计算单个分段的 R/S 值（重标极差）"""
+        n = len(segment)
+        mean = segment.mean()
+        deviate = segment - mean
+        cumulative = np.cumsum(deviate)
+        r = cumulative.max() - cumulative.min()
+        s = segment.std(ddof=1)
+        if s < 1e-12:
+            return np.nan
+        return r / s
+
     def _calculate_hurst_external(self, spread: pd.Series, detrend: bool = True) -> tuple[float, str]:
         """
-        使用 nolds 库计算 Hurst 指数（R/S 分析）
+        纯 numpy 实现的 Hurst 指数计算（R/S 分析）
 
         Args:
             spread: 价差序列（协整残差，应为平稳的 I(0) 序列）
@@ -304,16 +315,41 @@ class CointegrationHealthMonitor:
             if np.std(values) < 1e-10:
                 return np.nan, "CONSTANT_SERIES"
 
-            # 使用 nolds 库计算 Hurst 指数
-            # nvals: 分段数量，默认 None 让 nolds 自动选择
-            # fit: 使用 RANSAC 拟合更稳健（对异常值不敏感）
-            hurst = nolds.hurst_rs(
-                values,
-                nvals=None,      # 自动选择分段数量
-                fit='RANSAC',    # 使用 RANSAC 拟合（更稳健）
-                debug_plot=False,
-                plot_file=None
-            )
+            # 生成分段长度：从 10 到 n//2，取对数均匀分布的点
+            min_seg = 10
+            max_seg = n // 2
+            if max_seg < min_seg:
+                return np.nan, "INSUFFICIENT_DATA"
+
+            seg_sizes = np.unique(np.logspace(
+                np.log10(min_seg), np.log10(max_seg), num=20
+            ).astype(int))
+
+            log_n = []
+            log_rs = []
+
+            for seg_size in seg_sizes:
+                num_segs = n // seg_size
+                if num_segs < 1:
+                    continue
+                # 计算每段的 R/S，取均值
+                rs_values = []
+                for i in range(num_segs):
+                    segment = values[i * seg_size: (i + 1) * seg_size]
+                    rs = self._rs_rescaled_range(segment)
+                    if not np.isnan(rs):
+                        rs_values.append(rs)
+                if rs_values:
+                    log_n.append(np.log(seg_size))
+                    log_rs.append(np.log(np.mean(rs_values)))
+
+            if len(log_n) < 3:
+                return np.nan, "INSUFFICIENT_SEGMENTS"
+
+            # 最小二乘线性回归: log(R/S) = H * log(n) + c
+            log_n = np.array(log_n)
+            log_rs = np.array(log_rs)
+            hurst = np.polyfit(log_n, log_rs, 1)[0]
 
             # 边界检查
             if np.isnan(hurst) or np.isinf(hurst):

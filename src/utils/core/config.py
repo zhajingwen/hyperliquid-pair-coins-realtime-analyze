@@ -6,17 +6,10 @@ from src.utils.core.logging_config import logger
 lark_bot_id: Optional[str] = os.getenv('LARKBOT_ID')
 lark_webhook_url: Optional[str] = f'https://open.larksuite.com/open-apis/bot/v2/hook/{lark_bot_id}' if lark_bot_id else None
 lark_alert_email: str = os.getenv('LARK_ALERT_EMAIL', '')
-redis_password: Optional[str] = os.getenv('REDIS_PASSWORD')
 TIMESCALEDB_USER: str = os.getenv('TIMESCALEDB_USER', 'postgres')
 TIMESCALEDB_PASSWORD: str = os.getenv('TIMESCALEDB_PASSWORD', 'postgres')
 TIMESCALEDB_HOST = os.getenv('TIMESCALEDB_HOST', '127.0.0.1')
 TIMESCALEDB_PORT = int(os.getenv('TIMESCALEDB_PORT', 5432))
-
-# ============ 环境配置 ============
-env = 'local'
-
-# ============ Redis配置 ============
-redis_host = '127.0.0.1'
 
 # ============ TimescaleDB配置 ============
 # TIMESCALEDB_HOST = '127.0.0.1'
@@ -150,15 +143,8 @@ LARK_MAX_RETRIES = 3  # 最大重试次数
 LARK_REQUEST_TIMEOUT = 10.0  # 请求超时(秒)
 LARK_BACKOFF_BASE = 2  # 指数退避基数
 
-# ============ 调度器配置 ============
-SCHEDULER_WEEKDAY_CHECK_INTERVAL = 60  # 工作日检查间隔(秒)
-SCHEDULER_TIME_CHECK_INTERVAL = 10  # 时间检查间隔(秒)
-SCHEDULER_EXECUTION_WINDOW_MINUTES = 10  # 执行窗口(分钟)
-SCHEDULER_POST_EXECUTION_WAIT_SECONDS = 3600  # 执行后等待(秒)
-
 # ============ 服务线程超时配置 ============
 QUEUE_GET_TIMEOUT = 1.0  # 队列读取超时(秒)
 WORKER_THREAD_SHUTDOWN_TIMEOUT = 5.0  # 工作线程关闭超时(秒)
 MAIN_THREAD_SHUTDOWN_TIMEOUT = 10.0  # 主线程关闭超时(秒)
-CPU_CHECK_INTERVAL = 0.1  # CPU检查间隔(秒)
 DB_QUERY_LIMIT = 10000  # 数据库查询限制

@@ -306,10 +306,6 @@ class EnhancedWebSocketManager:
     # ⭐ 改进 #1: 多回调系统管理方法
     # =====================================================
 
-    def get_callbacks_count(self) -> int:
-        """获取当前回调数量"""
-        return len(self.message_callbacks)
-
     # =====================================================
     # ⭐ 改进 #2: 数据缓存方法
     # =====================================================
@@ -372,63 +368,6 @@ class EnhancedWebSocketManager:
 
         except Exception as e:
             logger.debug(f"数据缓存失败: {e}")
-
-    def get_latest_candle(self, coin: str, interval: str) -> Optional[Dict]:
-        """
-        获取最新K线数据 (同步查询接口)
-
-        Args:
-            coin: 币种名称，如 "BTC"
-            interval: 时间间隔，如 "5m"
-
-        Returns:
-            最新K线消息，如果不存在返回 None
-
-        示例:
-            candle = manager.get_latest_candle("BTC", "5m")
-            if candle:
-                data = candle.get("data", {})
-                close_price = data.get("c")
-                print(f"BTC 最新价格: {close_price}")
-        """
-        cache_key = f"{coin}:{interval}"
-        with self.latest_data_lock:
-            return self.latest_data.get(cache_key)
-
-    def get_latest_orderbook(self, coin: str) -> Optional[Dict]:
-        """获取最新订单簿数据"""
-        cache_key = f"{coin}:l2Book"
-        with self.latest_data_lock:
-            return self.latest_data.get(cache_key)
-
-    def get_latest_trades(self, coin: str) -> Optional[Dict]:
-        """获取最新交易记录"""
-        cache_key = f"{coin}:trades"
-        with self.latest_data_lock:
-            return self.latest_data.get(cache_key)
-
-    def get_latest_mid_price(self, coin: str) -> Optional[float]:
-        """
-        获取最新中间价 (allMids)
-
-        Args:
-            coin: 币种名称
-
-        Returns:
-            最新中间价，如果不存在返回 None
-        """
-        cache_key = f"{coin}:mid"
-        with self.latest_data_lock:
-            cached = self.latest_data.get(cache_key)
-            if cached:
-                data = cached.get("data", {})
-                price_str = data.get("price")
-                if price_str:
-                    try:
-                        return float(price_str)
-                    except (ValueError, TypeError):
-                        return None
-            return None
 
     def get_cache_status(self) -> Dict[str, int]:
         """
