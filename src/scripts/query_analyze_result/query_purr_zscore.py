@@ -208,6 +208,84 @@ def format_output(results: List[Dict], output_format: str = 'table'):
             print(f"  异常数量 (|z|>2.5): {len([z for z in zscore_values if abs(z) > 2.5])}")
             print(f"  极端异常 (|z|>3): {len([z for z in zscore_values if abs(z) > 3])}")
 
+            # 最近4小时平均值
+            now = datetime.now().astimezone()
+            four_hours_ago = now - timedelta(hours=4)
+            recent_4h_values = [
+                r['zscore_4h'] for r in results
+                if r['zscore_4h'] is not None and r['kline_time'] is not None
+                and to_local_time(r['kline_time']) >= four_hours_ago
+            ]
+            if recent_4h_values:
+                avg_4h = sum(recent_4h_values) / len(recent_4h_values)
+                print(f"  最近4小时平均值: {avg_4h:.4f} (共{len(recent_4h_values)}条)")
+            else:
+                print(f"  最近4小时平均值: 无数据")
+
+        # 最近30天每天的统计
+        from collections import defaultdict
+        daily_stats = defaultdict(lambda: {
+            'max_abs': 0, 'value': 0, 'time': None,
+            'max_positive': None, 'min_negative': None
+        })
+
+        for r in results:
+            if r['zscore_4h'] is None or r['kline_time'] is None:
+                continue
+            kline_time_local = to_local_time(r['kline_time'])
+            date_key = kline_time_local.strftime('%Y-%m-%d')
+            zscore = r['zscore_4h']
+            abs_value = abs(zscore)
+
+            # 更新绝对值最大值
+            if abs_value > daily_stats[date_key]['max_abs']:
+                daily_stats[date_key]['max_abs'] = abs_value
+                daily_stats[date_key]['value'] = zscore
+                daily_stats[date_key]['time'] = kline_time_local.strftime('%H:%M')
+
+            # 更新正值最大值
+            if zscore > 0:
+                if daily_stats[date_key]['max_positive'] is None or zscore > daily_stats[date_key]['max_positive']:
+                    daily_stats[date_key]['max_positive'] = zscore
+
+            # 更新负值最小值
+            if zscore < 0:
+                if daily_stats[date_key]['min_negative'] is None or zscore < daily_stats[date_key]['min_negative']:
+                    daily_stats[date_key]['min_negative'] = zscore
+
+        if daily_stats:
+            # 按日期排序，取最近30天
+            sorted_dates = sorted(daily_stats.keys(), reverse=True)[:30]
+            sorted_dates.reverse()  # 按时间正序显示
+
+            print(f"\n最近30天每日 Z-Score 统计:")
+            print("-" * 76)
+            print(f"{'日期':<12} {'时间':<8} {'|Z|最大值':<12} {'正值最大':<12} {'负值最小':<12}")
+            print("-" * 76)
+            for date in sorted_dates:
+                info = daily_stats[date]
+                max_pos_str = f"{info['max_positive']:>+.4f}" if info['max_positive'] is not None else "    N/A "
+                min_neg_str = f"{info['min_negative']:>+.4f}" if info['min_negative'] is not None else "    N/A "
+                print(f"{date:<12} {info['time']:<8} {info['value']:>+.4f}     {max_pos_str}     {min_neg_str}")
+            print("-" * 76)
+
+            # 统计30天内的极值
+            max_abs_all = max(daily_stats[d]['max_abs'] for d in sorted_dates)
+            max_date = [d for d in sorted_dates if daily_stats[d]['max_abs'] == max_abs_all][0]
+            print(f"30天内最大绝对值: {max_abs_all:.4f} (日期: {max_date})")
+
+            # 30天内正值最大和负值最小
+            all_max_pos = [daily_stats[d]['max_positive'] for d in sorted_dates if daily_stats[d]['max_positive'] is not None]
+            all_min_neg = [daily_stats[d]['min_negative'] for d in sorted_dates if daily_stats[d]['min_negative'] is not None]
+            if all_max_pos:
+                max_pos_val = max(all_max_pos)
+                max_pos_date = [d for d in sorted_dates if daily_stats[d]['max_positive'] == max_pos_val][0]
+                print(f"30天内正值最大: {max_pos_val:+.4f} (日期: {max_pos_date})")
+            if all_min_neg:
+                min_neg_val = min(all_min_neg)
+                min_neg_date = [d for d in sorted_dates if daily_stats[d]['min_negative'] == min_neg_val][0]
+                print(f"30天内负值最小: {min_neg_val:+.4f} (日期: {min_neg_date})")
+
 
 def main():
     """主函数"""

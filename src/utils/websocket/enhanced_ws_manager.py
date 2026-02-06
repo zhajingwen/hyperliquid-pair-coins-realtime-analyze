@@ -275,6 +275,9 @@ class EnhancedWebSocketManager:
         # 停止事件
         self.stop_event = threading.Event()
 
+        # 重连互斥锁（防止 _on_close 和 _monitor_health 同时触发重连）
+        self._reconnect_lock = threading.Lock()
+
         # 统计信息
         self.start_time = time.time()
         self.last_error: Optional[Exception] = None
@@ -1118,6 +1121,17 @@ class EnhancedWebSocketManager:
 
     def _reconnect(self):
         """重连逻辑（指数退避策略 + 告警机制）"""
+        # 防止并发重连：如果另一个线程已在重连，直接返回
+        if not self._reconnect_lock.acquire(blocking=False):
+            logger.info("跳过重连: 另一个线程已在执行重连")
+            return
+        try:
+            self._reconnect_inner()
+        finally:
+            self._reconnect_lock.release()
+
+    def _reconnect_inner(self):
+        """重连内部逻辑（由 _reconnect 持锁调用）"""
         self._update_state(ConnectionState.RECONNECTING)
 
         while self.reconnection_manager.should_retry() and not self.stop_event.is_set():
@@ -1193,6 +1207,10 @@ class EnhancedWebSocketManager:
             try:
                 # 等待连接就绪
                 if not self.ws_ready_event.wait(timeout=WS_READY_TIMEOUT):
+                    continue
+
+                # 如果正在重连中，跳过本轮检查
+                if self.state == ConnectionState.RECONNECTING:
                     continue
 
                 # 检查底层连接

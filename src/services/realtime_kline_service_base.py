@@ -1192,9 +1192,18 @@ class RealtimeKlineServiceBase(ABC):
                 )
                 self.stats['analysis_result_buffer_drops'] += 1
 
+            # 提取目标币种最新价格（5m K线最新收盘价）
+            latest_alt_price = None
+            period_key_5m = ('5m', '7d')
+            if period_key_5m in price_data_cache:
+                alt_klines_5m = price_data_cache[period_key_5m]['alt_klines']
+                if alt_klines_5m:
+                    # query_range ORDER BY time DESC，第一条是最新的
+                    latest_alt_price = alt_klines_5m[0].get('close')
+
             # 仅在所有验证通过时发送飞书告警
             if validation_passed:
-                self._send_alert(symbol, timeframe, multi_period_result)
+                self._send_alert(symbol, timeframe, multi_period_result, latest_alt_price)
                 elapsed = time.time() - start_time
                 self.logger.info(f"✅ 多周期验证通过: {symbol} @ {timeframe} | {elapsed:.2f}秒")
             else:
@@ -1212,7 +1221,7 @@ class RealtimeKlineServiceBase(ABC):
             self.logger.error(f"多周期分析失败: {symbol} @ {timeframe} | {e}", exc_info=True)
             self.stats['analyses_failed'] += 1
 
-    def _send_alert(self, symbol: str, timeframe: str, multi_period_result: Dict):
+    def _send_alert(self, symbol: str, timeframe: str, multi_period_result: Dict, latest_alt_price: float = None):
         """
         发送多周期验证告警
 
@@ -1220,6 +1229,7 @@ class RealtimeKlineServiceBase(ABC):
             symbol: 币种
             timeframe: 触发周期
             multi_period_result: 多周期验证结果
+            latest_alt_price: 目标币种最新价格
         """
         try:
             direction_emoji = "📈" if multi_period_result['direction'] == 'long' else "📉"
@@ -1230,7 +1240,8 @@ class RealtimeKlineServiceBase(ABC):
                 symbol=symbol,
                 base_symbol=self.base_symbol,
                 timeframe=timeframe,
-                multi_period_result=multi_period_result
+                multi_period_result=multi_period_result,
+                latest_alt_price=latest_alt_price,
             )
 
             sender_colourful(

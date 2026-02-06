@@ -95,13 +95,6 @@ HEALTH_MONITOR_SCORE_WEIGHTS: Tuple[float, float, float] = (0.4, 0.3, 0.3)  # �
 # ============ 多周期分析配置 ============
 REQUIRED_PERIODS = [('5m', '7d'), ('1h', '30d'), ('4h', '60d')]
 
-# # 周期到Z-score阈值类型的映射
-# PERIOD_TO_ZSCORE_THRESHOLD: Dict[Tuple[str, str], str] = {
-#     ('5m', '7d'): 'short',   # 使用 ZSCORE_THRESHOLDS['short'] = 1.8
-#     ('1h', '30d'): 'middle',  # 使用 ZSCORE_THRESHOLDS['middle'] = 1.5
-#     ('4h', '60d'): 'long'     # 使用 ZSCORE_THRESHOLDS['long'] = 0.2
-# }
-
 # ============ 告警格式化配置 ============
 ALERT_SIGNAL_STRENGTH: Dict[str, float] = {'extreme': 1.5, 'strong': 1.0, 'medium': 0.5}
 ALERT_QUALITY: Dict[str, int] = {'excellent': 5, 'good': 4, 'fair': 3}

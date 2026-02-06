@@ -48,7 +48,8 @@ class AlertFormatter:
         base_symbol: str,
         timeframe: str,
         multi_period_result: Dict,
-        timestamp: Optional[datetime] = None
+        timestamp: Optional[datetime] = None,
+        latest_alt_price: Optional[float] = None
     ) -> str:
         """
         生成丰富格式的告警内容
@@ -59,6 +60,7 @@ class AlertFormatter:
             timeframe: 触发周期
             multi_period_result: 多周期验证结果
             timestamp: 告警时间（默认当前系统本地时间）
+            latest_alt_price: 目标币种最新价格
 
         Returns:
             str: 格式化的Markdown告警内容
@@ -75,7 +77,7 @@ class AlertFormatter:
 
         # 构建各部分内容
         sections = [
-            self._format_header(symbol, base_symbol, timestamp),
+            self._format_header(symbol, base_symbol, timestamp, latest_alt_price),
             self._format_signal_overview(timeframe, zscore_4h, direction, cointegration_count),
             self._format_zscore_verification(zscore_5m, zscore_1h, zscore_4h),
             self._format_correlation_table(details),
@@ -87,12 +89,16 @@ class AlertFormatter:
 
         return '\n'.join(filter(None, sections))
 
-    def _format_header(self, symbol: str, base_symbol: str, timestamp: datetime) -> str:
+    def _format_header(self, symbol: str, base_symbol: str, timestamp: datetime, latest_alt_price: Optional[float] = None) -> str:
         """格式化头部信息"""
         time_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+        price_line = ""
+        if latest_alt_price is not None:
+            alt_name = symbol.split('/')[0]
+            price_line = f"\n        **{alt_name}价格**: ${latest_alt_price:,.4f}"
         return f"""**币种**: {symbol}
         **基准**: {base_symbol}
-        **时间**: {time_str}
+        **时间**: {time_str}{price_line}
 
         ---"""
 
