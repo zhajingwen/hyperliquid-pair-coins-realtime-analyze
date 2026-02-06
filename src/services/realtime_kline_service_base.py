@@ -87,6 +87,14 @@ class ServiceConfig:
     logger_module: str                 # logger 模块标识（'logger' 或 'get_logger'）
 
 
+@dataclass
+class MeanReversionState:
+    """均值回归事件循环状态"""
+    baseline: float              # 建仓时的 avg_zscore_4h
+    direction: str               # 'long' 或 'short'
+    signal_time: datetime = None  # 建仓时间
+
+
 class RealtimeKlineServiceBase(ABC):
     """
     实时K线分析服务抽象基类
@@ -247,8 +255,13 @@ class RealtimeKlineServiceBase(ABC):
             'analysis_results_written': 0,
             'analysis_results_deduped': 0,
             'analysis_result_buffer_drops': 0,
-            'start_time': time.time()
+            'start_time': time.time(),
+            'reversion_alerts_sent': 0,
         }
+
+        # 20. 均值回归事件循环缓存
+        self._mean_reversion_cache: Dict[str, MeanReversionState] = {}
+        self._mean_reversion_lock = threading.Lock()
 
         self.logger.info("✅ 实时K线分析服务初始化完成")
 
@@ -1208,9 +1221,20 @@ class RealtimeKlineServiceBase(ABC):
             except Exception as e:
                 self.logger.warning(f"查询4h Z-score均值失败: {symbol} | {e}")
 
+            # 取当前实时 zscore_4h（瞬时值）
+            current_zscore_4h = multi_period_result['zscore_list'][2]
+
+            # 平仓信号检测（先闭合旧循环，再开启新循环）
+            reversion_info = self._check_mean_reversion(symbol, current_zscore_4h)
+            if reversion_info is not None:
+                self._send_reversion_alert(reversion_info)
+
             # 仅在所有验证通过时发送飞书告警
             if validation_passed:
                 self._send_alert(symbol, timeframe, multi_period_result, latest_alt_price, avg_zscore_4h)
+                # 缓存建仓 baseline（用 avg_zscore_4h 作为均值水平）
+                if avg_zscore_4h is not None:
+                    self._cache_signal_baseline(symbol, avg_zscore_4h, multi_period_result['direction'])
                 elapsed = time.time() - start_time
                 self.logger.info(f"✅ 多周期验证通过: {symbol} @ {timeframe} | {elapsed:.2f}秒")
             else:
@@ -1273,6 +1297,140 @@ class RealtimeKlineServiceBase(ABC):
         except Exception as e:
             self.logger.error(f"飞书告警发送失败: {e}", exc_info=True)
 
+    def _check_mean_reversion(self, symbol: str, current_zscore_4h: float) -> Optional[Dict]:
+        """
+        检查均值回归平仓信号
+
+        Args:
+            symbol: 币种
+            current_zscore_4h: 实时 zscore_4h 瞬时值
+
+        Returns:
+            回归信息 dict（触发平仓时），否则 None
+        """
+        if current_zscore_4h is None:
+            return None
+
+        with self._mean_reversion_lock:
+            state = self._mean_reversion_cache.get(symbol)
+            if state is None:
+                return None
+
+            # 回归判定
+            if state.direction == 'long':
+                # long 方向：瞬时值从负极端回到 baseline 水平
+                reverted = current_zscore_4h >= state.baseline
+            else:
+                # short 方向：瞬时值从正极端回到 baseline 水平
+                reverted = current_zscore_4h <= state.baseline
+
+            if reverted:
+                reversion_info = {
+                    'symbol': symbol,
+                    'direction': state.direction,
+                    'baseline': state.baseline,
+                    'current_value': current_zscore_4h,
+                    'signal_time': state.signal_time,
+                    'reversion_time': datetime.now(timezone.utc),
+                }
+                del self._mean_reversion_cache[symbol]
+                self.logger.info(
+                    f"🔄 平仓触发: {symbol} | 方向: {state.direction} | "
+                    f"baseline: {state.baseline:.4f} → current: {current_zscore_4h:.4f}"
+                )
+                return reversion_info
+
+            self.logger.debug(
+                f"均值回归追踪中: {symbol} | 方向: {state.direction} | "
+                f"baseline: {state.baseline:.4f} | current: {current_zscore_4h:.4f}"
+            )
+            return None
+
+    def _cache_signal_baseline(self, symbol: str, avg_zscore_4h: float, direction: str):
+        """
+        缓存建仓信号的 baseline（avg_zscore_4h）
+
+        Args:
+            symbol: 币种
+            avg_zscore_4h: 建仓时的 4h Z-score 均值
+            direction: 建仓方向 'long' 或 'short'
+        """
+        with self._mean_reversion_lock:
+            self._mean_reversion_cache[symbol] = MeanReversionState(
+                baseline=avg_zscore_4h,
+                direction=direction,
+                signal_time=datetime.now(timezone.utc),
+            )
+        self.logger.info(
+            f"📌 建仓缓存: {symbol} | 方向: {direction} | "
+            f"baseline(avg_zscore_4h): {avg_zscore_4h:.4f}"
+        )
+
+    def _send_reversion_alert(self, reversion_info: Dict):
+        """
+        发送均值回归平仓告警
+
+        Args:
+            reversion_info: 回归信息字典
+        """
+        try:
+            symbol = reversion_info['symbol']
+            direction = reversion_info['direction']
+            baseline = reversion_info['baseline']
+            current_value = reversion_info['current_value']
+            signal_time = reversion_info['signal_time']
+            reversion_time = reversion_info['reversion_time']
+
+            # 计算持仓时长
+            if signal_time and reversion_time:
+                duration = reversion_time - signal_time
+                total_seconds = int(duration.total_seconds())
+                hours = total_seconds // 3600
+                minutes = (total_seconds % 3600) // 60
+                duration_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+            else:
+                duration_str = "未知"
+
+            # 格式化时间
+            signal_time_str = signal_time.strftime('%Y-%m-%d %H:%M:%S') if signal_time else "未知"
+
+            # 方向展示
+            direction_emoji = "📈" if direction == 'long' else "📉"
+            direction_text = "做多 (Long)" if direction == 'long' else "做空 (Short)"
+
+            # 提取币种简称
+            coin_name = symbol.split('/')[0] if '/' in symbol else symbol
+
+            title = f"🔄 平仓信号（均值回归）- {coin_name}"
+
+            content = (
+                f"**【平仓信号】**\n"
+                f"├─ 建仓方向: {direction_emoji} {direction_text}\n"
+                f"├─ 建仓时间: {signal_time_str}\n"
+                f"├─ 持仓时长: {duration_str}\n"
+                f"└─ 状态: 🔄 Z-score 已回归\n\n"
+                f"**【Z-score 4h回归】**\n"
+                f"├─ 建仓时的均值(最近4小时内): {baseline:.4f}\n"
+                f"└─ 当前值 (current):    {current_value:.4f}\n\n"
+                f"💡 实时 Z-score 4h 已回归至建仓时的均值水平，建议平仓。"
+            )
+
+            sender_colourful(
+                url=self.lark_webhook_url,
+                content=content,
+                title=title
+            )
+
+            self.stats['reversion_alerts_sent'] += 1
+
+            self.logger.info(
+                f"📢 平仓告警已发送: {symbol} | 方向: {direction} | "
+                f"baseline: {baseline:.4f} → current: {current_value:.4f}"
+            )
+
+        except Exception as e:
+            self.logger.error(f"平仓告警发送失败: {e}", exc_info=True)
+
     # ============================================================
     # 监控线程
     # ============================================================
@@ -1326,7 +1484,8 @@ class RealtimeKlineServiceBase(ABC):
                     f"结果: {result_size}/{result_capacity} ({result_util*100:.1f}%) | "
                     f"去重字典: 入队{enqueue_dict_size} 分析{analysis_dict_size} | "
                     f"丢弃统计: 分析队列{self.stats.get('analysis_queue_drops', 0)} 结果队列{self.stats.get('analysis_result_buffer_drops', 0)} | "
-                    f"新币黑名单: {blacklist_size}"
+                    f"新币黑名单: {blacklist_size} | "
+                    f"均值回归追踪: {len(self._mean_reversion_cache)}"
                 )
 
                 if analysis_util >= warning_threshold or result_util >= warning_threshold or kline_util >= warning_threshold:
@@ -1600,6 +1759,7 @@ class RealtimeKlineServiceBase(ABC):
         self.logger.info(f"   - 分析结果去重: {stats.get('analysis_results_deduped', 0)}")
         self.logger.info(f"   - 分析结果丢弃: {stats.get('analysis_result_buffer_drops', 0)}")
         self.logger.info(f"   - 告警发送: {stats['alerts_sent']}")
+        self.logger.info(f"   - 平仓告警: {stats.get('reversion_alerts_sent', 0)}")
         self.logger.info(f"   - 运行时长: {stats['uptime_seconds']:.0f}秒")
 
         self.logger.info("✅ 服务已停止")
