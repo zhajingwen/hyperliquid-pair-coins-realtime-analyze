@@ -243,45 +243,6 @@ class CointegrationHealthMonitor:
         except Exception as e:
             return 0, np.inf, f"EXCEPTION_{type(e).__name__}", None
 
-    # ---------------- 去趋势处理 ----------------
-    def _detrend_series(self, series: pd.Series) -> np.ndarray:
-        """
-        去除序列的线性趋势
-
-        Args:
-            series: 输入序列
-
-        Returns:
-            去趋势后的数组
-        """
-        values = series.dropna().values
-        n = len(values)
-
-        # 使用线性回归去趋势
-        X = np.arange(n).reshape(-1, 1)
-        y = values.reshape(-1, 1)
-
-        # 简单线性回归（使用 numpy，避免依赖 sklearn）
-        # y = a + b*x
-        x_mean = X.mean()
-        y_mean = y.mean()
-
-        # 计算斜率 b
-        numerator = np.sum((X.flatten() - x_mean) * (y.flatten() - y_mean))
-        denominator = np.sum((X.flatten() - x_mean) ** 2)
-        b = numerator / denominator if denominator != 0 else 0
-
-        # 计算截距 a
-        a = y_mean - b * x_mean
-
-        # 计算趋势线
-        trend = a + b * X.flatten()
-
-        # 去趋势
-        detrended = values - trend
-
-        return detrended
-
     # ---------------- Hurst 指数计算 ----------------
     def _detrend_values(self, values: np.ndarray) -> np.ndarray:
         """

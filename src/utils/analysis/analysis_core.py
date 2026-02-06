@@ -970,9 +970,6 @@ __all__ = [
     # Z-score计算
     'calculate_zscore_ols',
 
-    # 异常检测
-    'detect_anomaly',
-
     # 综合分析
     'analyze_pair_advanced',
     'analyze_multi_period'

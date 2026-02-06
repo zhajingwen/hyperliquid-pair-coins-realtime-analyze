@@ -306,43 +306,6 @@ class EnhancedWebSocketManager:
     # ⭐ 改进 #1: 多回调系统管理方法
     # =====================================================
 
-    def add_callback(self, callback: Callable[[Dict], None]) -> None:
-        """
-        添加消息回调 (借鉴 hyperliquid-trading-bot)
-
-        Args:
-            callback: 消息回调函数，签名: (msg: Dict) -> None
-
-        示例:
-            def my_callback(msg):
-                print(f"收到消息: {msg}")
-
-            manager.add_callback(my_callback)
-        """
-        if callback not in self.message_callbacks:
-            self.message_callbacks.append(callback)
-            logger.info(f"✅ 添加回调成功 | 当前回调数: {len(self.message_callbacks)}")
-        else:
-            logger.warning("⚠️ 回调已存在，跳过添加")
-
-    def remove_callback(self, callback: Callable[[Dict], None]) -> bool:
-        """
-        移除消息回调
-
-        Args:
-            callback: 要移除的回调函数
-
-        Returns:
-            bool: 是否成功移除
-        """
-        try:
-            self.message_callbacks.remove(callback)
-            logger.info(f"✅ 移除回调成功 | 当前回调数: {len(self.message_callbacks)}")
-            return True
-        except ValueError:
-            logger.warning("⚠️ 回调不存在，无需移除")
-            return False
-
     def get_callbacks_count(self) -> int:
         """获取当前回调数量"""
         return len(self.message_callbacks)
@@ -484,19 +447,6 @@ class EnhancedWebSocketManager:
                     stats[data_type] = stats.get(data_type, 0) + 1
 
             return stats
-
-    def clear_cache(self) -> int:
-        """
-        清空缓存数据
-
-        Returns:
-            清空的数据条数
-        """
-        with self.latest_data_lock:
-            count = len(self.latest_data)
-            self.latest_data.clear()
-            logger.info(f"🗑️ 缓存已清空 | 清除条数: {count}")
-            return count
 
     # =====================================================
     # 连接状态检查
@@ -1055,37 +1005,6 @@ class EnhancedWebSocketManager:
         except Exception as e:
             logger.error(f"取消订阅失败: {e}", exc_info=True)
             return False
-
-    def clear_all_subscriptions(self) -> int:
-        """
-        清空所有订阅
-
-        Returns:
-            int: 清除的订阅数量
-        """
-        try:
-            with self.subscriptions_lock:
-                count = len(self.subscriptions)
-
-                # 如果连接已建立，发送取消订阅消息
-                if self._is_connected():
-                    for subscription in list(self.subscriptions):
-                        try:
-                            msg = {"method": "unsubscribe", "subscription": subscription}
-                            self.ws.send(json.dumps(msg))
-                        except Exception as e:
-                            logger.debug(f"发送取消订阅消息失败: {e}")
-
-                # 清空订阅列表
-                self.subscriptions.clear()
-                self.active_subscriptions.clear()
-
-                logger.info(f"🗑️ 所有订阅已清空 | 清除数量: {count}")
-                return count
-
-        except Exception as e:
-            logger.error(f"清空订阅失败: {e}", exc_info=True)
-            return 0
 
     def get_subscriptions_status(self) -> Dict[str, Any]:
         """

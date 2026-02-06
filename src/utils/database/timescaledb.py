@@ -71,14 +71,6 @@ class TimescaleDBConfig:
             f"@{self.host}:{self.port}/{self.database}"
         )
 
-    @property
-    def connection_string_safe(self) -> str:
-        """生成安全的连接字符串（密码掩码，用于日志记录）"""
-        return (
-            f"postgresql://{self.user}:***"
-            f"@{self.host}:{self.port}/{self.database}"
-        )
-
     def __repr__(self) -> str:
         """返回安全的字符串表示（不包含密码）"""
         return (
@@ -242,31 +234,6 @@ class TimescaleDBClient:
         except Exception as e:
             logger.error(f"查询执行失败: {query[:100]}... | 错误: {e}")
             raise
-
-    def execute_transaction(
-        self,
-        queries: List[Tuple[str, Optional[Tuple]]]
-    ) -> bool:
-        """
-        执行事务（多条SQL语句）
-
-        Args:
-            queries: SQL语句列表，格式 [(query, params), ...]
-
-        Returns:
-            bool: 事务是否成功
-        """
-        try:
-            with self.get_connection() as conn:
-                with conn.cursor() as cur:
-                    for query, params in queries:
-                        cur.execute(query, params)
-                    conn.commit()
-                    logger.info(f"事务执行成功: {len(queries)} 条语句")
-                    return True
-        except Exception as e:
-            logger.error(f"事务执行失败: {e}")
-            return False
 
     def health_check(self) -> bool:
         """
@@ -491,101 +458,6 @@ class KlineRepository:
             (symbol, timeframe, start_time, end_time)
         )
 
-    def get_latest_timestamp(
-        self,
-        symbol: str,
-        timeframe: str
-    ) -> Optional[datetime]:
-        """
-        获取指定币种和周期的最新K线时间
-
-        Args:
-            symbol: 币种符号
-            timeframe: 时间周期
-
-        Returns:
-            最新K线时间戳
-        """
-        result = self.client.execute_query(
-            """
-            SELECT MAX(time) AS latest_time
-            FROM klines
-            WHERE symbol = %s AND timeframe = %s
-            """,
-            (symbol, timeframe),
-            fetch_one=True
-        )
-
-        return result['latest_time'] if result else None
-
-    def get_data_coverage(
-        self,
-        symbol: str,
-        timeframe: str,
-        days: int = 90
-    ) -> Dict[str, Any]:
-        """
-        获取数据覆盖率统计
-
-        Args:
-            symbol: 币种符号
-            timeframe: 时间周期
-            days: 统计天数
-
-        Returns:
-            数据覆盖率信息
-        """
-        result = self.client.execute_query(
-            """
-            SELECT
-                COUNT(*) AS total_klines,
-                MIN(time) AS first_time,
-                MAX(time) AS last_time,
-                MAX(time) - MIN(time) AS time_span
-            FROM klines
-            WHERE symbol = %s
-                AND timeframe = %s
-                AND time >= NOW() - make_interval(days => %s)
-            """,
-            (symbol, timeframe, days),
-            fetch_one=True
-        )
-
-        return result if result else {}
-
-    def delete_symbol_data(
-        self,
-        symbol: str,
-        timeframe: Optional[str] = None
-    ) -> int:
-        """
-        删除指定币种的K线数据
-
-        Args:
-            symbol: 币种符号
-            timeframe: 时间周期（可选，不指定则删除所有周期）
-
-        Returns:
-            删除的记录数
-        """
-        if timeframe:
-            query = "DELETE FROM klines WHERE symbol = %s AND timeframe = %s"
-            params = (symbol, timeframe)
-        else:
-            query = "DELETE FROM klines WHERE symbol = %s"
-            params = (symbol,)
-
-        try:
-            with self.client.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(query, params)
-                    deleted_count = cur.rowcount
-                    conn.commit()
-                    logger.info(f"删除数据成功: {deleted_count} 条记录")
-                    return deleted_count
-        except Exception as e:
-            logger.error(f"删除数据失败: {e}")
-            raise
 
 
 # =====================================================
@@ -657,43 +529,6 @@ class SymbolMetadataRepository:
             logger.error(f"币种元数据更新失败: {e}")
             return False
 
-    def update_data_quality(
-        self,
-        symbol: str,
-        quality_score: float,
-        total_klines: int
-    ) -> bool:
-        """
-        更新币种数据质量评分
-
-        Args:
-            symbol: 币种符号
-            quality_score: 质量评分（0-1.0）
-            total_klines: K线总数
-
-        Returns:
-            bool: 操作是否成功
-        """
-        try:
-            with self.client.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE symbol_metadata
-                        SET
-                            data_quality_score = %s,
-                            total_klines = %s,
-                            updated_at = NOW()
-                        WHERE symbol = %s;
-                        """,
-                        (quality_score, total_klines, symbol)
-                    )
-                    conn.commit()
-                    return True
-        except Exception as e:
-            logger.error(f"数据质量更新失败: {e}")
-            return False
-
     def get_active_symbols(self) -> List[str]:
         """
         获取所有活跃币种列表
@@ -712,35 +547,6 @@ class SymbolMetadataRepository:
 
         return [r['symbol'] for r in results] if results else []
 
-    def mark_inactive(self, symbol: str) -> bool:
-        """
-        标记币种为不活跃
-
-        Args:
-            symbol: 币种符号
-
-        Returns:
-            bool: 操作是否成功
-        """
-        try:
-            with self.client.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE symbol_metadata
-                        SET
-                            is_active = FALSE,
-                            updated_at = NOW()
-                        WHERE symbol = %s;
-                        """,
-                        (symbol,)
-                    )
-                    conn.commit()
-                    logger.info(f"币种已标记为不活跃: {symbol}")
-                    return True
-        except Exception as e:
-            logger.error(f"标记不活跃失败: {e}")
-            return False
 
 
 # =====================================================
@@ -955,38 +761,6 @@ class AnalysisResultRepository:
             logger.error(f"分析结果批量写入失败 (COPY模式): {e}")
             raise
 
-    def query_recent_anomalies(
-        self,
-        hours: int = 24,
-        limit: int = 100
-    ) -> List[Dict]:
-        """
-        查询最近的异常信号
-
-        Args:
-            hours: 查询最近N小时的数据
-            limit: 最大返回记录数
-
-        Returns:
-            异常信号列表
-        """
-        return self.client.execute_query(
-            """
-            SELECT
-                analysis_time, symbol, base_symbol,
-                corr_5m_7d, corr_1h_30d, corr_4h_60d,
-                zscore_5m, zscore_1h, zscore_4h,
-                cointegration_passed, adf_pvalue,
-                trading_direction, signal_strength
-            FROM analysis_results
-            WHERE is_anomaly = TRUE
-                AND analysis_time >= NOW() - INTERVAL '%s hours'
-            ORDER BY analysis_time DESC
-            LIMIT %s;
-            """,
-            (hours, limit)
-        )
-
     def query_avg_zscore_4h(self, symbol: str, hours: int = 4) -> Optional[float]:
         """
         查询最近N小时内的4h级别Z-score平均值
@@ -1012,79 +786,6 @@ class AnalysisResultRepository:
             return float(results[0]['avg_zscore_4h'])
         return None
 
-    def get_daily_stats(
-        self,
-        symbol: Optional[str] = None,
-        days: int = 7
-    ) -> List[Dict]:
-        """
-        查询每日统计数据（使用连续聚合视图）
-
-        Args:
-            symbol: 币种符号（可选）
-            days: 查询最近N天的数据
-
-        Returns:
-            每日统计列表
-        """
-        if symbol:
-            query = """
-                SELECT
-                    day, symbol, base_symbol,
-                    analysis_count, anomaly_count,
-                    avg_corr_5m, avg_corr_1h, avg_corr_4h,
-                    avg_zscore_5m, avg_zscore_1h, avg_zscore_4h
-                FROM daily_analysis_stats
-                WHERE symbol = %s
-                    AND day >= NOW() - make_interval(days => %s)
-                ORDER BY day DESC;
-            """
-            params = (symbol, days)
-        else:
-            query = """
-                SELECT
-                    day, symbol, base_symbol,
-                    analysis_count, anomaly_count,
-                    avg_corr_5m, avg_corr_1h, avg_corr_4h,
-                    avg_zscore_5m, avg_zscore_1h, avg_zscore_4h
-                FROM daily_analysis_stats
-                WHERE day >= NOW() - make_interval(days => %s)
-                ORDER BY day DESC, anomaly_count DESC;
-            """
-            params = (days,)
-
-        return self.client.execute_query(query, params)
-
-    def delete_old_results(self, days: int = 180) -> int:
-        """
-        删除历史分析结果（超过N天）
-
-        注意：保留策略会自动清理180天前的数据，
-        此方法用于手动清理或更激进的清理策略
-
-        Args:
-            days: 保留最近N天的数据
-
-        Returns:
-            删除的记录数
-        """
-        try:
-            with self.client.get_connection() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        DELETE FROM analysis_results
-                        WHERE analysis_time < NOW() - make_interval(days => %s);
-                        """,
-                        (days,)
-                    )
-                    deleted_count = cur.rowcount
-                    conn.commit()
-                    logger.info(f"历史数据清理成功: {deleted_count} 条记录")
-                    return deleted_count
-        except Exception as e:
-            logger.error(f"历史数据清理失败: {e}")
-            raise
 
 
 # =====================================================
