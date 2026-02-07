@@ -435,6 +435,21 @@ WS_SUBSCRIBE_BATCH_SIZE = 50      # 批量订阅大小
 
 ---
 
+### 系统资源监控
+
+本项目包含一个专门的资源监控脚本 `monitor_resources.py`，用于监控 Akash 容器或本地环境的 CPU、内存、磁盘和网络使用情况。
+
+```bash
+# 基本使用（默认5秒刷新）
+python monitor_resources.py
+
+# 指定刷新间隔（例如2秒）
+python monitor_resources.py -i 2
+
+# 简化模式（不显示详细进程列表）
+python monitor_resources.py -s
+```
+
 ## 辅助工具
 
 ### BTC 自相关性分析
@@ -451,6 +466,12 @@ python src/scripts/validate_data_consistency.py
 
 ### 回测脚本
 
+详细的回测文档请参考：
+- [Hyperliquid 回测指南](../src/scripts/README_BACKTEST.md)
+- [Binance 回测指南](../src/scripts/README_BACKTEST_BINANCE.md)
+
+常用脚本：
+
 ```bash
 # ETH/BTC Z-score 4h 回测
 python src/scripts/backtest_eth_btc_zscore_4h.py
@@ -464,6 +485,8 @@ python src/scripts/backtest_purr_hype_zscore_4h_hyperliquid.py
 
 ### 分析结果查询
 
+更多查询脚本位于 `src/scripts/query_analyze_result/` 目录下：
+
 ```bash
 # 查询 PURR Z-score
 python src/scripts/query_analyze_result/query_purr_zscore.py
@@ -473,6 +496,12 @@ python src/scripts/query_analyze_result/query_purr_zscore_beyond2_5.py
 
 # 查询 ETH Z-score
 python src/scripts/query_analyze_result/query_eth_zscore.py
+
+# 检查当前基准币种数据
+python src/scripts/query_analyze_result/check_base_symbols.py
+
+# 检查数据库中的活跃币种
+python src/scripts/query_analyze_result/check_db_symbols.py
 ```
 
 ---
