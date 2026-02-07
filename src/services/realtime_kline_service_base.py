@@ -73,6 +73,10 @@ from src.utils.core.config import (
     # 监控配置
     QUEUE_MONITOR_INTERVAL,
     QUEUE_WARNING_THRESHOLD,
+    # 双重确认配置
+    DOUBLE_CHECK_WINDOW_SECONDS,
+    DOUBLE_CHECK_ZSCORE_5M_THRESHOLD,
+    DOUBLE_CHECK_CLEANUP_SECONDS,
 )
 
 
@@ -93,6 +97,14 @@ class MeanReversionState:
     baseline: float              # 建仓时的 avg_zscore_4h
     direction: str               # 'long' 或 'short'
     signal_time: datetime = None  # 建仓时间
+
+
+@dataclass
+class DoubleCheckState:
+    """建仓告警双重确认状态"""
+    zscore_5m: float                     # 触发时的 5m Z-score
+    direction: str                       # 'long' 或 'short'
+    first_signal_time: datetime = None   # 第一次信号时间 (UTC)
 
 
 class RealtimeKlineServiceBase(ABC):
@@ -257,11 +269,19 @@ class RealtimeKlineServiceBase(ABC):
             'analysis_result_buffer_drops': 0,
             'start_time': time.time(),
             'reversion_alerts_sent': 0,
+            'double_check_first_signals': 0,
+            'double_check_confirmed': 0,
+            'double_check_refreshed': 0,
+            'double_check_expired': 0,
         }
 
         # 20. 均值回归事件循环缓存
         self._mean_reversion_cache: Dict[str, MeanReversionState] = {}
         self._mean_reversion_lock = threading.Lock()
+
+        # 21. 建仓告警双重确认缓存
+        self._double_check_cache: Dict[str, DoubleCheckState] = {}
+        self._double_check_lock = threading.Lock()
 
         self.logger.info("✅ 实时K线分析服务初始化完成")
 
@@ -1225,14 +1245,83 @@ class RealtimeKlineServiceBase(ABC):
             if reversion_info is not None:
                 self._send_reversion_alert(reversion_info)
 
-            # 仅在所有验证通过时发送飞书告警
+            # 仅在所有验证通过时进入双重确认流程
             if validation_passed:
-                self._send_alert(symbol, timeframe, multi_period_result, latest_alt_price, avg_zscore_4h)
-                # 缓存建仓 baseline（用 avg_zscore_4h 作为均值水平）
-                if avg_zscore_4h is not None:
-                    self._cache_signal_baseline(symbol, avg_zscore_4h, multi_period_result['direction'])
-                elapsed = time.time() - start_time
-                self.logger.info(f"✅ 多周期验证通过: {symbol} @ {timeframe} | {elapsed:.2f}秒")
+                current_zscore_5m = multi_period_result['zscore_list'][0]
+                current_direction = multi_period_result['direction']
+                should_alert = False
+
+                with self._double_check_lock:
+                    existing = self._double_check_cache.get(symbol)
+
+                    if existing is None:
+                        # 第一次信号：记录状态，不发告警
+                        self._double_check_cache[symbol] = DoubleCheckState(
+                            zscore_5m=current_zscore_5m,
+                            direction=current_direction,
+                            first_signal_time=datetime.now(timezone.utc),
+                        )
+                        self.stats['double_check_first_signals'] += 1
+                        self.logger.info(
+                            f"🔔 双重确认[首次记录]: {symbol} | "
+                            f"方向: {current_direction} | 5m Z-score: {current_zscore_5m:.4f}"
+                        )
+                    else:
+                        time_diff = (datetime.now(timezone.utc) - existing.first_signal_time).total_seconds()
+
+                        if time_diff <= DOUBLE_CHECK_WINDOW_SECONDS:
+                            # 5分钟内：检查信号是否增强
+                            if (abs(current_zscore_5m) > abs(existing.zscore_5m)
+                                    and abs(current_zscore_5m) > DOUBLE_CHECK_ZSCORE_5M_THRESHOLD):
+                                # 条件2.1：信号增强且超阈值 → 确认通过
+                                del self._double_check_cache[symbol]
+                                should_alert = True
+                                self.stats['double_check_confirmed'] += 1
+                                self.logger.info(
+                                    f"✅ 双重确认[通过]: {symbol} | "
+                                    f"方向: {current_direction} | "
+                                    f"5m Z-score: {existing.zscore_5m:.4f} → {current_zscore_5m:.4f} | "
+                                    f"间隔: {time_diff:.0f}秒"
+                                )
+                            else:
+                                # 条件2.2：信号未增强 → 刷新状态（重置时间窗口）
+                                self._double_check_cache[symbol] = DoubleCheckState(
+                                    zscore_5m=current_zscore_5m,
+                                    direction=current_direction,
+                                    first_signal_time=datetime.now(timezone.utc),
+                                )
+                                self.stats['double_check_refreshed'] += 1
+                                self.logger.info(
+                                    f"🔄 双重确认[刷新]: {symbol} | "
+                                    f"5m Z-score: {existing.zscore_5m:.4f} → {current_zscore_5m:.4f} | "
+                                    f"abs未增强或未超{DOUBLE_CHECK_ZSCORE_5M_THRESHOLD}"
+                                )
+                        else:
+                            # 超过5分钟：重置为新的第一次
+                            self._double_check_cache[symbol] = DoubleCheckState(
+                                zscore_5m=current_zscore_5m,
+                                direction=current_direction,
+                                first_signal_time=datetime.now(timezone.utc),
+                            )
+                            self.stats['double_check_expired'] += 1
+                            self.logger.info(
+                                f"⏰ 双重确认[超时重置]: {symbol} | "
+                                f"间隔: {time_diff:.0f}秒 > {DOUBLE_CHECK_WINDOW_SECONDS}秒 | "
+                                f"重新开始等待确认"
+                            )
+
+                # 锁外执行 I/O 操作（避免持锁做网络请求）
+                if should_alert:
+                    self._send_alert(symbol, timeframe, multi_period_result, latest_alt_price, avg_zscore_4h)
+                    if avg_zscore_4h is not None:
+                        self._cache_signal_baseline(symbol, avg_zscore_4h, multi_period_result['direction'])
+                    elapsed = time.time() - start_time
+                    self.logger.info(f"✅ 多周期验证通过(双重确认): {symbol} @ {timeframe} | {elapsed:.2f}秒")
+                else:
+                    elapsed = time.time() - start_time
+                    self.logger.info(
+                        f"⏳ 多周期验证通过(等待双重确认): {symbol} @ {timeframe} | {elapsed:.2f}秒"
+                    )
             else:
                 elapsed = time.time() - start_time
                 self.logger.info(
@@ -1327,7 +1416,7 @@ class RealtimeKlineServiceBase(ABC):
                     'baseline': state.baseline,
                     'current_value': current_zscore_4h,
                     'signal_time': state.signal_time,
-                    'reversion_time': datetime.now(timezone.utc),
+                    'reversion_time': datetime.now(),
                 }
                 del self._mean_reversion_cache[symbol]
                 self.logger.info(
@@ -1355,7 +1444,7 @@ class RealtimeKlineServiceBase(ABC):
             self._mean_reversion_cache[symbol] = MeanReversionState(
                 baseline=avg_zscore_4h,
                 direction=direction,
-                signal_time=datetime.now(timezone.utc),
+                signal_time=datetime.now(),
             )
         self.logger.info(
             f"📌 建仓缓存: {symbol} | 方向: {direction} | "
@@ -1481,7 +1570,8 @@ class RealtimeKlineServiceBase(ABC):
                     f"去重字典: 入队{enqueue_dict_size} 分析{analysis_dict_size} | "
                     f"丢弃统计: 分析队列{self.stats.get('analysis_queue_drops', 0)} 结果队列{self.stats.get('analysis_result_buffer_drops', 0)} | "
                     f"新币黑名单: {blacklist_size} | "
-                    f"均值回归追踪: {len(self._mean_reversion_cache)}"
+                    f"均值回归追踪: {len(self._mean_reversion_cache)} | "
+                    f"双重确认等待: {len(self._double_check_cache)}"
                 )
 
                 if analysis_util >= warning_threshold or result_util >= warning_threshold or kline_util >= warning_threshold:
@@ -1502,6 +1592,21 @@ class RealtimeKlineServiceBase(ABC):
 
             except Exception as e:
                 self.logger.error(f"队列健康监控异常: {e}", exc_info=True)
+
+            # 清理过期的双重确认状态（防止内存泄漏）
+            try:
+                with self._double_check_lock:
+                    now = datetime.now(timezone.utc)
+                    expired = [
+                        sym for sym, state in self._double_check_cache.items()
+                        if (now - state.first_signal_time).total_seconds() > DOUBLE_CHECK_CLEANUP_SECONDS
+                    ]
+                    for sym in expired:
+                        del self._double_check_cache[sym]
+                    if expired:
+                        self.logger.debug(f"清理过期双重确认状态: {len(expired)} 个")
+            except Exception as e:
+                self.logger.error(f"双重确认状态清理异常: {e}", exc_info=True)
 
             self.stop_event.wait(monitor_interval)
 

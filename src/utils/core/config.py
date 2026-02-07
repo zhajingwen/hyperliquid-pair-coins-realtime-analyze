@@ -75,6 +75,11 @@ ALPHA_SAME_ASSET_THRESHOLD = 2.0
 CORRELATION_METHOD = 'pearson'  # 相关系数计算方法: pearson/kendall/spearman
 ADF_LAG_SELECTION_METHOD = 'AIC'  # ADF检验滞后选择: AIC/BIC/t-stat
 
+# ============ 建仓告警双重确认配置 ============
+DOUBLE_CHECK_WINDOW_SECONDS = 300       # 双重确认时间窗口（秒）
+DOUBLE_CHECK_ZSCORE_5M_THRESHOLD = 2.5  # 5m Z-score 绝对值阈值
+DOUBLE_CHECK_CLEANUP_SECONDS = 600      # 过期清理阈值（秒）
+
 # ============ 健康监控参数 ============
 HEALTH_MONITOR_LONG_WINDOW: int = 200
 HEALTH_MONITOR_SHORT_WINDOW: int = 100
