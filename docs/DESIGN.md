@@ -63,14 +63,18 @@
 
 #### 智能告警系统
 - **飞书富文本告警**: 彩色卡片格式化
-- **告警触发条件**:
+- **建仓告警触发条件**:
   - 协整通过数 ≥ 2 (可配置)
   - Z-score符号一致性
   - Z-score超阈值 (5m>1.8, 1h>1.5, 4h>0.2)
   - 协整健康状态约束 (短期窗口需HEALTHY)
+  - **双重确认**: 首次信号记录状态，5分钟内第二次信号增强确认后才发送告警
+- **平仓告警触发条件** (均值回归):
+  - 实时 zscore_4h 回归至建仓时的 baseline 水平
+  - **双重确认**: 首次检测到回归仅记录状态，5分钟内再次检测到回归仍成立才确认平仓
 - **重试机制**: 最大3次，指数退避
 
-**代码引用**: `src/utils/monitoring/alert_formatter.py`
+**代码引用**: `src/utils/monitoring/alert_formatter.py`, `src/services/realtime_kline_service_base.py:_check_mean_reversion`
 
 #### 数据质量保证
 - **K线连续性校验**: 检测时间间隙
@@ -1204,11 +1208,25 @@ flowchart TD
     N -->|短期窗口非HEALTHY| Z
     N -->|短期窗口HEALTHY| O[保存分析结果]
 
-    O --> P[发送飞书告警]
-    P --> Q[分析完成]
+    O --> DC1{建仓双重确认}
+    DC1 -->|首次信号| DC2[记录状态,等待确认]
+    DC1 -->|确认通过| P[发送建仓告警]
+    DC2 --> Q
+
+    P --> P2[缓存建仓baseline]
+    P2 --> Q[分析完成]
+
+    subgraph 平仓检测[均值回归平仓检测 - 每次分析都执行]
+        R1{zscore_4h 回归至 baseline?}
+        R1 -->|首次检测到回归| R2[记录首次回归时间]
+        R1 -->|窗口内再次检测| R3[平仓双重确认通过]
+        R1 -->|回归消失| R4[重置首次检测状态]
+        R1 -->|超出窗口| R5[超时重置为新首次]
+        R3 --> R6[发送平仓告警]
+    end
 ```
 
-**代码引用**: `src/services/realtime_kline_service.py:1037-1402`
+**代码引用**: `src/services/realtime_kline_service_base.py:_analyze_and_alert`, `src/services/realtime_kline_service_base.py:_check_mean_reversion`
 
 ### 5.2 相关性分析
 
@@ -2363,7 +2381,18 @@ self.stats = {
     'klines_written': 0,            # K线写入总数
     'analyses_completed': 0,        # 分析完成总数
     'analyses_failed': 0,           # 分析失败总数
-    'alerts_sent': 0,               # 告警发送总数
+    'alerts_sent': 0,               # 建仓告警发送总数
+    'reversion_alerts_sent': 0,     # 平仓告警发送总数
+    # 建仓双重确认统计
+    'double_check_first_signals': 0,    # 首次信号
+    'double_check_confirmed': 0,        # 确认通过
+    'double_check_refreshed': 0,        # 信号刷新
+    'double_check_expired': 0,          # 超时重置
+    # 平仓双重确认统计
+    'reversion_dc_first_signals': 0,    # 首次检测
+    'reversion_dc_confirmed': 0,        # 确认通过
+    'reversion_dc_expired': 0,          # 超时重置
+    'reversion_dc_reset': 0,            # 回归消失重置
     'uptime_seconds': 0,            # 服务运行时长
     'queue_kline_size': 0,          # K线队列大小
     'queue_analysis_size': 0,       # 分析队列大小
@@ -2379,7 +2408,7 @@ def get_stats(self) -> Dict:
     return self.stats
 ```
 
-**代码引用**: `src/services/realtime_kline_service.py:1661-1711`
+**代码引用**: `src/services/realtime_kline_service_base.py:259-280`
 
 #### 队列使用率监控
 
@@ -2920,6 +2949,10 @@ def get_pool_stats(self) -> Dict:
 | 资源 | cpu_usage_percent | CPU使用率 | >70% |
 | 连接 | ws_health_percentage | WebSocket健康度 | <50% |
 | 连接 | db_pool_usage | 数据库连接池使用率 | >90% |
+| 告警 | reversion_dc_first_signals | 平仓双重确认首次检测 | - |
+| 告警 | reversion_dc_confirmed | 平仓双重确认通过 | - |
+| 告警 | reversion_dc_expired | 平仓双重确认超时重置 | - |
+| 告警 | reversion_dc_reset | 平仓双重确认回归消失重置 | - |
 
 **代码引用**: `src/services/realtime_kline_service.py:1661-1711`
 
@@ -2933,6 +2966,15 @@ self.stats = {
     'analyses_failed': 0,
     'analyses_dropped': 0,
     'alerts_sent': 0,
+    'reversion_alerts_sent': 0,              # 平仓告警发送
+    'double_check_first_signals': 0,         # 建仓双重确认首次信号
+    'double_check_confirmed': 0,             # 建仓双重确认通过
+    'double_check_refreshed': 0,             # 建仓双重确认刷新
+    'double_check_expired': 0,               # 建仓双重确认超时
+    'reversion_dc_first_signals': 0,         # 平仓双重确认首次检测
+    'reversion_dc_confirmed': 0,             # 平仓双重确认通过
+    'reversion_dc_expired': 0,               # 平仓双重确认超时重置
+    'reversion_dc_reset': 0,                 # 平仓双重确认回归消失重置
     'uptime_seconds': 0,
     'queue_kline_size': 0,
     'queue_analysis_size': 0,
@@ -2957,11 +2999,12 @@ def print_stats_report(self):
         f"K线写入: {stats['klines_written']} | "
         f"分析完成: {stats['analyses_completed']} | "
         f"分析失败: {stats['analyses_failed']} | "
-        f"告警发送: {stats['alerts_sent']}"
+        f"告警发送: {stats['alerts_sent']} | "
+        f"平仓告警: {stats['reversion_alerts_sent']}"
     )
 ```
 
-**代码引用**: `src/services/realtime_kline_service.py:1661-1711`
+**代码引用**: `src/services/realtime_kline_service_base.py:259-280`
 
 ### 9.2 飞书告警格式化
 
@@ -3750,6 +3793,28 @@ MAX_RECENT_TASKS = 5000      # 最大缓存任务数
 ```
 
 **代码引用**: `src/utils/core/config.py:ENQUEUE_DEDUP_WINDOWS`, `src/utils/core/config.py:DEDUP_WINDOWS`
+
+#### 双重确认配置
+
+```python
+# 建仓告警双重确认
+DOUBLE_CHECK_WINDOW_SECONDS = 300       # 时间窗口（秒）
+DOUBLE_CHECK_ZSCORE_5M_THRESHOLD = 2.5  # 5m Z-score 绝对值阈值
+DOUBLE_CHECK_CLEANUP_SECONDS = 600      # 过期清理阈值（秒）
+
+# 平仓告警双重确认
+REVERSION_DOUBLE_CHECK_WINDOW_SECONDS = 300  # 时间窗口（秒）
+```
+
+**设计说明**:
+- **建仓双重确认**: 首次信号记录状态，窗口内第二次信号需 5m Z-score 绝对值增强且超阈值才确认
+- **平仓双重确认**: 首次检测到均值回归仅记录状态，窗口内再次检测到回归仍成立才确认平仓；若回归消失则重置
+
+**数据结构**:
+- `DoubleCheckState`: 建仓确认状态 (zscore_5m, direction, first_signal_time)
+- `MeanReversionState`: 均值回归状态 (baseline, direction, signal_time, first_reversion_time, first_reversion_value)
+
+**代码引用**: `src/utils/core/config.py:DOUBLE_CHECK_WINDOW_SECONDS`, `src/utils/core/config.py:REVERSION_DOUBLE_CHECK_WINDOW_SECONDS`
 
 #### 数据库配置
 

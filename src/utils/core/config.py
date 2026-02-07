@@ -80,6 +80,9 @@ DOUBLE_CHECK_WINDOW_SECONDS = 300       # 双重确认时间窗口（秒）
 DOUBLE_CHECK_ZSCORE_5M_THRESHOLD = 2.5  # 5m Z-score 绝对值阈值
 DOUBLE_CHECK_CLEANUP_SECONDS = 600      # 过期清理阈值（秒）
 
+# ============ 平仓告警双重确认配置 ============
+REVERSION_DOUBLE_CHECK_WINDOW_SECONDS = 300  # 平仓双重确认时间窗口（秒）
+
 # ============ 健康监控参数 ============
 HEALTH_MONITOR_LONG_WINDOW: int = 200
 HEALTH_MONITOR_SHORT_WINDOW: int = 100

@@ -77,6 +77,8 @@ from src.utils.core.config import (
     DOUBLE_CHECK_WINDOW_SECONDS,
     DOUBLE_CHECK_ZSCORE_5M_THRESHOLD,
     DOUBLE_CHECK_CLEANUP_SECONDS,
+    # 平仓双重确认配置
+    REVERSION_DOUBLE_CHECK_WINDOW_SECONDS,
 )
 
 
@@ -97,6 +99,8 @@ class MeanReversionState:
     baseline: float              # 建仓时的 avg_zscore_4h
     direction: str               # 'long' 或 'short'
     signal_time: datetime = None  # 建仓时间
+    first_reversion_time: datetime = None   # 首次回归检测时间
+    first_reversion_value: float = None     # 首次回归时的 zscore_4h
 
 
 @dataclass
@@ -273,6 +277,10 @@ class RealtimeKlineServiceBase(ABC):
             'double_check_confirmed': 0,
             'double_check_refreshed': 0,
             'double_check_expired': 0,
+            'reversion_dc_first_signals': 0,
+            'reversion_dc_confirmed': 0,
+            'reversion_dc_expired': 0,
+            'reversion_dc_reset': 0,
         }
 
         # 20. 均值回归事件循环缓存
@@ -1384,14 +1392,23 @@ class RealtimeKlineServiceBase(ABC):
 
     def _check_mean_reversion(self, symbol: str, current_zscore_4h: float) -> Optional[Dict]:
         """
-        检查均值回归平仓信号
+        检查均值回归平仓信号（二次确认机制）
+
+        在时间窗口内连续两次检测到回归才确认平仓，避免误报。
+
+        流程:
+        1. reverted=True + first_reversion_time is None → 首次记录
+        2. reverted=True + first_reversion_time + 在窗口内 → 确认平仓
+        3. reverted=True + first_reversion_time + 超出窗口 → 超时重置
+        4. reverted=False + first_reversion_time is not None → 回归消失重置
+        5. reverted=False + first_reversion_time is None → 正常追踪
 
         Args:
             symbol: 币种
             current_zscore_4h: 实时 zscore_4h 瞬时值
 
         Returns:
-            回归信息 dict（触发平仓时），否则 None
+            回归信息 dict（确认平仓时），否则 None
         """
         if current_zscore_4h is None:
             return None
@@ -1403,33 +1420,74 @@ class RealtimeKlineServiceBase(ABC):
 
             # 回归判定
             if state.direction == 'long':
-                # long 方向：瞬时值从负极端回到 baseline 水平
                 reverted = current_zscore_4h >= state.baseline
             else:
-                # short 方向：瞬时值从正极端回到 baseline 水平
                 reverted = current_zscore_4h <= state.baseline
 
-            if reverted:
-                reversion_info = {
-                    'symbol': symbol,
-                    'direction': state.direction,
-                    'baseline': state.baseline,
-                    'current_value': current_zscore_4h,
-                    'signal_time': state.signal_time,
-                    'reversion_time': datetime.now(),
-                }
-                del self._mean_reversion_cache[symbol]
-                self.logger.info(
-                    f"🔄 平仓触发: {symbol} | 方向: {state.direction} | "
-                    f"baseline: {state.baseline:.4f} → current: {current_zscore_4h:.4f}"
-                )
-                return reversion_info
+            now = datetime.now(timezone.utc)
 
-            self.logger.debug(
-                f"均值回归追踪中: {symbol} | 方向: {state.direction} | "
-                f"baseline: {state.baseline:.4f} | current: {current_zscore_4h:.4f}"
-            )
-            return None
+            if reverted:
+                if state.first_reversion_time is None:
+                    # 分支1: 首次检测到回归，记录时间和值，不触发
+                    state.first_reversion_time = now
+                    state.first_reversion_value = current_zscore_4h
+                    self.stats['reversion_dc_first_signals'] += 1
+                    self.logger.info(
+                        f"🔔 平仓双重确认[首次记录]: {symbol} | 方向: {state.direction} | "
+                        f"baseline: {state.baseline:.4f} | current: {current_zscore_4h:.4f}"
+                    )
+                    return None
+
+                time_diff = (now - state.first_reversion_time).total_seconds()
+
+                if time_diff <= REVERSION_DOUBLE_CHECK_WINDOW_SECONDS:
+                    # 分支2: 窗口内二次确认通过 → 触发平仓
+                    reversion_info = {
+                        'symbol': symbol,
+                        'direction': state.direction,
+                        'baseline': state.baseline,
+                        'current_value': current_zscore_4h,
+                        'signal_time': state.signal_time,
+                        'reversion_time': now,
+                    }
+                    del self._mean_reversion_cache[symbol]
+                    self.stats['reversion_dc_confirmed'] += 1
+                    self.logger.info(
+                        f"✅ 平仓双重确认[通过]: {symbol} | 方向: {state.direction} | "
+                        f"baseline: {state.baseline:.4f} | "
+                        f"首次: {state.first_reversion_value:.4f} → 确认: {current_zscore_4h:.4f} | "
+                        f"间隔: {time_diff:.0f}秒"
+                    )
+                    return reversion_info
+                else:
+                    # 分支3: 超出窗口，重置为新的首次检测
+                    state.first_reversion_time = now
+                    state.first_reversion_value = current_zscore_4h
+                    self.stats['reversion_dc_expired'] += 1
+                    self.logger.info(
+                        f"⏰ 平仓双重确认[超时重置]: {symbol} | 方向: {state.direction} | "
+                        f"间隔: {time_diff:.0f}秒 > {REVERSION_DOUBLE_CHECK_WINDOW_SECONDS}秒 | "
+                        f"重新开始等待确认"
+                    )
+                    return None
+            else:
+                if state.first_reversion_time is not None:
+                    # 分支4: 回归消失，清除首次检测状态
+                    state.first_reversion_time = None
+                    state.first_reversion_value = None
+                    self.stats['reversion_dc_reset'] += 1
+                    self.logger.info(
+                        f"↩️ 平仓双重确认[回归消失]: {symbol} | 方向: {state.direction} | "
+                        f"baseline: {state.baseline:.4f} | current: {current_zscore_4h:.4f} | "
+                        f"回归条件不再满足，重置首次检测"
+                    )
+                else:
+                    # 分支5: 正常追踪中
+                    self.logger.debug(
+                        f"均值回归追踪中: {symbol} | 方向: {state.direction} | "
+                        f"baseline: {state.baseline:.4f} | current: {current_zscore_4h:.4f}"
+                    )
+                return None
 
     def _cache_signal_baseline(self, symbol: str, avg_zscore_4h: float, direction: str):
         """
@@ -1562,6 +1620,13 @@ class RealtimeKlineServiceBase(ABC):
                 with self.blacklist_lock:
                     blacklist_size = len(self.new_coin_blacklist)
 
+                with self._mean_reversion_lock:
+                    reversion_total = len(self._mean_reversion_cache)
+                    reversion_dc_waiting = sum(
+                        1 for s in self._mean_reversion_cache.values()
+                        if s.first_reversion_time is not None
+                    )
+
                 status_msg = (
                     f"📊 队列健康监控 | "
                     f"K线: {kline_size}/{kline_capacity} ({kline_util*100:.1f}%) | "
@@ -1570,7 +1635,7 @@ class RealtimeKlineServiceBase(ABC):
                     f"去重字典: 入队{enqueue_dict_size} 分析{analysis_dict_size} | "
                     f"丢弃统计: 分析队列{self.stats.get('analysis_queue_drops', 0)} 结果队列{self.stats.get('analysis_result_buffer_drops', 0)} | "
                     f"新币黑名单: {blacklist_size} | "
-                    f"均值回归追踪: {len(self._mean_reversion_cache)} | "
+                    f"均值回归追踪: {reversion_total} (平仓确认等待: {reversion_dc_waiting}) | "
                     f"双重确认等待: {len(self._double_check_cache)}"
                 )
 

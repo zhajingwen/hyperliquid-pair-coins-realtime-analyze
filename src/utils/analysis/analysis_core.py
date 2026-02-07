@@ -847,7 +847,7 @@ def analyze_multi_period(
             'cointegration_count': cointegration_count,
             'direction': 'none',
             'details': details,
-            'fail_reason': f'cointegration_count ({cointegration_count}) < threshold ({cointegration_threshold})'
+            'fail_reason': f'协整数量不足（{cointegration_count} < 阈值{cointegration_threshold}）'
         }
 
     # 验证2: 健康监控检查
@@ -887,7 +887,7 @@ def analyze_multi_period(
             'cointegration_count': cointegration_count,
             'direction': 'none',
             'details': details,
-            'fail_reason': 'zscore sign inconsistency'
+            'fail_reason': 'Z-score符号不一致（多周期方向矛盾）'
         }
 
     # 验证3: Z-score阈值检查
@@ -930,7 +930,7 @@ def analyze_multi_period(
             'cointegration_count': cointegration_count,
             'direction': 'none',
             'details': details,
-            'fail_reason': 'zscore threshold not met'
+            'fail_reason': 'Z-score阈值不足（未达到开仓条件）'
         }
 
     # 所有验证通过，确定交易方向
