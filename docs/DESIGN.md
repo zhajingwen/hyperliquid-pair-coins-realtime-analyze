@@ -1,7 +1,7 @@
 # hyperliquid-pair-hype-purr-analyze 技术设计文档
 
-**版本**: v1.1
-**生成日期**: 2026-01-31
+**版本**: v1.2
+**更新日期**: 2026-02-07
 **作者**: Claude Code
 **项目**: 加密货币配对交易信号实时分析系统
 
@@ -20,7 +20,17 @@
 - [9. 监控与告警](#9-监控与告警)
 - [10. 部署设计](#10-部署设计)
 - [11. 配置管理](#11-配置管理)
-- [12. 附录](#12-附录)
+- [12. 建仓双重确认与平仓机制](#12-建仓双重确认与平仓机制)
+- [13. 附录](#13-附录)
+
+**版本变更 (v1.1 → v1.2)**:
+- 工作线程: 15 → 30, 总线程: ~22 → ~37
+- 连接池: min=2,max=10 → min=5,max=60
+- 队列: analysis_queue 15000 → 30000
+- 相关系数阈值: 通用版0.85→0.6, HYPE版0.99→0.5
+- 新增: 建仓双重确认 (DoubleCheckState)、均值回归平仓 (MeanReversionState)
+- 重连最大延迟: 60s → 10s
+- ServiceConfig 字段重构: 新增 logger_module, 移除 enable_new_symbol_monitor
 
 ---
 
@@ -65,16 +75,17 @@
 - **飞书富文本告警**: 彩色卡片格式化
 - **建仓告警触发条件**:
   - 协整通过数 ≥ 2 (可配置)
-  - Z-score符号一致性
+  - Z-score符号一致性（3周期方向一致）
   - Z-score超阈值 (5m>1.8, 1h>1.5, 4h>0.2)
   - 协整健康状态约束 (短期窗口需HEALTHY)
-  - **双重确认**: 首次信号记录状态，5分钟内第二次信号增强确认后才发送告警
+  - **双重确认** (`DoubleCheckState`): 首次信号记录状态，5分钟内第二次信号增强（|Z-score|增大且>2.5）确认后才发送告警
 - **平仓告警触发条件** (均值回归):
-  - 实时 zscore_4h 回归至建仓时的 baseline 水平
-  - **双重确认**: 首次检测到回归仅记录状态，5分钟内再次检测到回归仍成立才确认平仓
+  - 实时 zscore_4h 回归至建仓时的 baseline 水平（avg_zscore_4h）
+  - **双重确认** (`MeanReversionState`): 首次检测到回归仅记录状态，5分钟内再次检测到回归仍成立才确认平仓
+  - 回归消失时自动重置首次检测状态
 - **重试机制**: 最大3次，指数退避
 
-**代码引用**: `src/utils/monitoring/alert_formatter.py`, `src/services/realtime_kline_service_base.py:_check_mean_reversion`
+**代码引用**: `src/utils/monitoring/alert_formatter.py`, `src/services/realtime_kline_service_base.py:1393-1490`
 
 #### 数据质量保证
 - **K线连续性校验**: 检测时间间隙
@@ -164,22 +175,22 @@
 **代码引用**: `enhanced_ws_manager.py:54-114`
 
 #### 5. 智能重连策略
-- **指数退避**: 1s → 2s → 4s → 8s → 16s → 32s → 60s
+- **指数退避**: 1s → 2s → 4s → 8s → 10s (封顶)
 - **随机抖动**: ±25% (防止雷鸣羊群效应)
-- **最大重试**: 30次
+- **最大重试**: 无限次 (WS_MAX_RETRIES=None)
 - **5步确定性清理**: 停止循环 → 停止Ping → 关闭连接 → 等待线程 → 清除引用
 
 **代码引用**: `enhanced_ws_manager.py:120-183`, `enhanced_ws_manager.py:698-781`
 
 #### 6. Template Method Pattern 架构
-- **90%共同逻辑**: 1599行基类封装核心流程
-- **4个抽象方法**: 子类定制差异化行为（币种获取、基准设置、监控开关、数据填充器）
-- **2个实现版本**: 通用版（动态币种，15 workers，22线程）+ HYPE版（固定币种，2 workers，8线程）
+- **90%共同逻辑**: 1931行基类封装核心流程
+- **4个抽象方法**: 子类定制差异化行为（币种获取、配置参数、监控开关、相关系数阈值）
+- **2个实现版本**: 通用版（动态币种，30 workers，~37线程）+ HYPE版（固定币种，2 workers，~8线程）
 - **配置参数化**: ServiceConfig 数据类传递配置差异
 
 **设计优势**: 消除代码重复，提升可维护性，支持多场景部署
 
-**代码引用**: `src/services/realtime_kline_service_base.py:1-1599`
+**代码引用**: `src/services/realtime_kline_service_base.py:1-1931`
 
 ---
 
@@ -194,12 +205,12 @@ graph TD
     B -->|on_message| D[K线解析]
 
     D -->|5m/1h/4h K线| E[kline_buffer<br/>Queue 10000]
-    D -->|5m推送触发| F[analysis_queue<br/>Queue 15000]
+    D -->|5m推送触发| F[analysis_queue<br/>Queue 30000]
 
     E -->|批量1000条/5秒| G[batch_writer线程]
     G -->|COPY命令| H[(TimescaleDB<br/>klines表)]
 
-    F -->|并发消费| I[N×analysis_worker线程<br/>通用版:15 / HYPE版:2]
+    F -->|并发消费| I[N×analysis_worker线程<br/>通用版:30 / HYPE版:2]
     I -->|多周期验证| J[analysis_result_buffer<br/>Queue 10000]
     I -->|Z-score异常| K[飞书告警<br/>Lark Bot API]
 
@@ -225,12 +236,12 @@ graph TD
 |------|------|------|--------|
 | EnhancedWebSocketManager | 网络管理器 | WebSocket连接管理、订阅管理、健康监控 | 3 (主线程+Ping+健康检查) |
 | batch_writer | 数据持久化 | K线批量写入TimescaleDB (COPY命令) | 1 |
-| analysis_worker | 分析引擎 | 多周期协整验证、Z-score计算、告警发送 | 15 |
+| analysis_worker | 分析引擎 | 多周期协整验证、Z-score计算、告警发送 | 30 |
 | result_batch_writer | 结果持久化 | 分析结果批量写入 | 1 |
-| queue_monitor | 监控线程 | 队列使用率监控、告警 | 1 |
+| queue_monitor | 监控线程 | 队列使用率监控、去重清理、双重确认清理 | 1 |
 | new_symbol_monitor | 币种监控 | 自动发现新币种、动态订阅 | 1 |
 
-**总线程数**: 22个线程 (3+1+15+1+1+1)
+**总线程数**: ~37个线程 (3+1+30+1+1+1)
 
 **代码引用**: `src/services/realtime_kline_service.py:224-275`
 
@@ -254,7 +265,7 @@ graph TD
 
 4. **并发分析流程**:
    ```
-   analysis_queue → 15×analysis_worker → 查询历史数据 → 多周期验证 → 结果入队
+   analysis_queue → 30×analysis_worker → 查询历史数据 → 多周期验证 → 结果入队
    ```
 
 5. **告警发送流程**:
@@ -374,7 +385,7 @@ sequenceDiagram
 - ✅ 并发分析任务完全独立，线程池模式适合
 
 **权衡**:
-- ❌ 线程上下文切换开销 (但15线程规模可接受)
+- ❌ 线程上下文切换开销 (但37线程规模可接受)
 - ✅ 避免asyncio生态碎片化问题
 
 **代码引用**: `src/services/realtime_kline_service.py:224-275`
@@ -392,23 +403,23 @@ sequenceDiagram
 
 **架构组成**:
 1. **ServiceConfig 数据类**: 参数化配置差异
-2. **RealtimeKlineServiceBase 抽象基类**: 封装1599行核心流程
-3. **RealtimeKlineService 通用版**: 182行实现，动态币种获取
-4. **RealtimeKlineServiceHype HYPE版**: 146行实现，固定币种配对
+2. **RealtimeKlineServiceBase 抽象基类**: 封装1931行核心流程
+3. **RealtimeKlineService 通用版**: 183行实现，动态币种获取
+4. **RealtimeKlineServiceHypePurr HYPE版**: 137行实现，固定币种配对
 
 #### ServiceConfig 配置类
 
-**数据结构** (`src/services/realtime_kline_service_base.py:80-89`):
+**数据结构** (`src/services/realtime_kline_service_base.py:85-93`):
 ```python
 @dataclass
 class ServiceConfig:
-    """服务配置数据类"""
+    """服务配置参数数据类"""
     base_symbol: str                    # 基准币种 (如 "BTC/USDC:USDC" 或 "HYPE/USDC:USDC")
-    correlation_threshold: float        # 相关系数阈值 (0.85 或 0.99)
-    analysis_workers: int               # 分析线程数 (15 或 2)
-    queue_config: dict                  # 队列大小配置
-    enable_new_symbol_monitor: bool     # 是否启用新币种监控
-    data_filler_class: Type             # 数据填充器类型
+    corr_threshold: float              # 相关系数阈值 (0.6 或 0.5)
+    queue_config: Dict[str, int]       # 队列配置
+    analysis_workers: int              # 工作线程数 (30 或 2)
+    data_filler_class: Type            # 数据填充器类
+    logger_module: str                 # logger 模块标识（'logger' 或 'get_logger'）
 ```
 
 **配置对比**:
@@ -416,43 +427,44 @@ class ServiceConfig:
 | 配置字段 | 通用版 | HYPE版 | 差异原因 |
 |---------|--------|--------|---------|
 | base_symbol | BTC/USDC:USDC | HYPE/USDC:USDC | HYPE版专注单一配对 |
-| correlation_threshold | 0.85 | 0.99 | HYPE版要求更高相关性 |
-| analysis_workers | 15 | 2 | HYPE版订阅数少，减少线程 |
-| kline_buffer | 10000 | 5000 | HYPE版订阅数少 |
-| analysis_queue | 15000 | 3000 | 分析任务少 |
-| enable_new_symbol_monitor | ✅ True | ❌ False | HYPE版固定币种列表 |
+| corr_threshold | 0.6 | 0.5 | HYPE版使用更宽松阈值 |
+| analysis_workers | 30 | 2 | HYPE版订阅数少，减少线程 |
+| kline_buffer_size | 10000 | 1000 | HYPE版订阅数少 |
+| analysis_queue_size | 30000 | 1000 | HYPE版分析任务少 |
+| analysis_result_buffer_size | 10000 | 1000 | HYPE版结果产生速度低 |
 | data_filler_class | KlineDataFiller | KlineDataFillerLazy | HYPE版使用懒加载 |
+| logger_module | 'logger' | 'logger' | 日志模块标识 |
 
 #### RealtimeKlineServiceBase 抽象基类
 
-**核心职责** (`src/services/realtime_kline_service_base.py:92-1599`):
+**核心职责** (`src/services/realtime_kline_service_base.py:114-1931`):
 - ✅ WebSocket连接管理（ping/健康监控/断线重连）
 - ✅ K线数据接收和批量写入
-- ✅ 分析任务队列管理（15个worker线程）
-- ✅ 结果写入和告警发送
+- ✅ 分析任务队列管理（通用版30个 / HYPE版2个 worker线程）
+- ✅ 结果写入和告警发送（含建仓/平仓双重确认）
 - ✅ 队列监控和性能统计
 
 **4个抽象方法** (子类必须实现):
 
 ```python
 @abstractmethod
-def get_symbols(self) -> List[str]:
-    """获取需要订阅的币种列表"""
+def _get_active_symbols(self) -> List[str]:
+    """获取活跃币种列表"""
     pass
 
 @abstractmethod
-def get_base_symbol(self) -> str:
-    """获取基准币种"""
+def _get_config_params(self) -> ServiceConfig:
+    """获取服务配置参数"""
     pass
 
 @abstractmethod
-def should_monitor_new_symbols(self) -> bool:
-    """是否启用新币种监控"""
+def _should_enable_symbol_monitoring(self) -> bool:
+    """是否启用新币种监控线程"""
     pass
 
 @abstractmethod
-def create_data_filler(self) -> KlineDataFiller:
-    """创建数据填充器实例"""
+def _get_corr_threshold_for_analysis(self) -> float:
+    """获取分析用的相关系数阈值"""
     pass
 ```
 
@@ -461,48 +473,57 @@ def create_data_filler(self) -> KlineDataFiller:
 | 维度 | 通用版 | HYPE版 |
 |------|--------|--------|
 | **文件** | `src/services/realtime_kline_service.py` | `src/services/realtime_kline_service_hype.py` |
-| **文件大小** | 182行 | 146行 |
-| **币种来源** | 动态获取（TimescaleDB查询） | 固定列表 `["PURR/USDC:USDC"]` |
+| **文件大小** | 183行 | 137行 |
+| **币种来源** | 动态获取（TimescaleDB查询 + 交易所API） | 固定列表 `["HYPE/USDC:USDC", "PURR/USDC:USDC"]` |
 | **基准币种** | BTC/USDC:USDC | HYPE/USDC:USDC |
-| **相关系数阈值** | 0.85 | 0.99 |
-| **分析线程数** | 15 | 2 |
-| **队列大小** | kline:10000, analysis:15000 | kline:5000, analysis:3000 |
-| **币种监控** | ✅ 启用（每5分钟检测新币种） | ❌ 禁用 |
+| **相关系数阈值** | 0.6 | 0.5 |
+| **分析线程数** | 30 | 2 |
+| **队列大小** | kline:10000, analysis:30000, result:10000 | kline:1000, analysis:1000, result:1000 |
+| **币种监控** | ✅ 启用（自动发现新币种） | ❌ 禁用 |
 | **数据填充器** | KlineDataFiller | KlineDataFillerLazy |
-| **总线程数** | 22 | 8 |
+| **总线程数** | ~37 | ~8 |
 
 **通用版实现** (`src/services/realtime_kline_service.py:89-103`):
 ```python
-def get_symbols(self) -> List[str]:
-    """动态获取币种列表（从TimescaleDB）"""
-    with self.pool.connection() as conn:
-        # 查询最近24小时有交易的币种
-        symbols = conn.execute(
-            "SELECT DISTINCT symbol FROM klines WHERE time > NOW() - INTERVAL '24 hours'"
-        ).fetchall()
-    return [s[0] for s in symbols]
+def _get_config_params(self) -> ServiceConfig:
+    """获取通用版服务配置参数"""
+    return ServiceConfig(
+        base_symbol=DEFAULT_BASE_SYMBOL,
+        corr_threshold=TARGET_CORR_THRESHOLD,
+        queue_config=QUEUE_CONFIG_GENERAL,
+        analysis_workers=ANALYSIS_WORKERS_GENERAL,
+        data_filler_class=KlineDataFiller,
+        logger_module='logger'
+    )
 
-def should_monitor_new_symbols(self) -> bool:
+def _should_enable_symbol_monitoring(self) -> bool:
     return True  # 启用新币种监控
 ```
 
-**HYPE版实现** (`src/services/realtime_kline_service_hype.py:87-101`):
+**HYPE版实现** (`src/services/realtime_kline_service_hype.py:78-110`):
 ```python
-def get_symbols(self) -> List[str]:
-    """返回固定币种列表"""
-    return ["PURR/USDC:USDC"]
+def _get_config_params(self) -> ServiceConfig:
+    """获取 HYPE/PURR 专用版服务配置参数"""
+    return ServiceConfig(
+        base_symbol=HYPE_BASE_SYMBOL,
+        corr_threshold=HYPE_CORR_THRESHOLD,
+        queue_config=QUEUE_CONFIG_HYPE,
+        analysis_workers=ANALYSIS_WORKERS_HYPE,
+        data_filler_class=KlineDataFillerLazy,
+        logger_module='logger'
+    )
 
-def should_monitor_new_symbols(self) -> bool:
+def _should_enable_symbol_monitoring(self) -> bool:
     return False  # 禁用新币种监控
 ```
 
 #### 架构优势
 
 **代码复用率**:
-- ✅ 共享代码: 1599行（90%）
-- ✅ 通用版独有: 182行（10%）
-- ✅ HYPE版独有: 146行（8%）
-- ✅ 消除重复: 避免1440+行重复代码
+- ✅ 共享代码: 1931行（90%）
+- ✅ 通用版独有: 183行（10%）
+- ✅ HYPE版独有: 137行（7%）
+- ✅ 消除重复: 避免1700+行重复代码
 
 **维护效率**:
 - ✅ 单点修改: bug修复只需改基类
@@ -517,12 +538,12 @@ def should_monitor_new_symbols(self) -> bool:
 **测试友好**:
 - ✅ 隔离测试: 基类逻辑独立测试
 - ✅ Mock简单: 抽象方法易于Mock
-- ✅ 覆盖率高: 1599行基类测试覆盖90%代码
+- ✅ 覆盖率高: 1931行基类测试覆盖90%代码
 
 **代码引用**:
-- 基类: `src/services/realtime_kline_service_base.py:80-1599`
-- 通用版: `src/services/realtime_kline_service.py:1-182`
-- HYPE版: `src/services/realtime_kline_service_hype.py:1-146`
+- 基类: `src/services/realtime_kline_service_base.py:85-1931`
+- 通用版: `src/services/realtime_kline_service.py:1-183`
+- HYPE版: `src/services/realtime_kline_service_hype.py:1-137`
 
 ---
 
@@ -814,8 +835,8 @@ class TimescaleDBClient:
 ```python
 self._pool = ConnectionPool(
     conninfo=self.config.connection_string,
-    min_size=2,    # 最小连接数
-    max_size=10,   # 最大连接数
+    min_size=5,    # 最小连接数
+    max_size=60,   # 最大连接数（匹配30个工作线程 × 2）
     timeout=30,    # 获取连接超时（秒）
     max_lifetime=3600,  # 连接最大存活时间（秒）
     max_idle=600,       # 最大空闲时间（秒）
@@ -824,8 +845,8 @@ self._pool = ConnectionPool(
 ```
 
 **参数说明**:
-- `min_size=2`: 保持最少2个活跃连接
-- `max_size=10`: 最多10个并发连接
+- `min_size=5`: 保持最少5个活跃连接
+- `max_size=60`: 最多60个并发连接（30个工作线程 × 2，避免连接池耗尽）
 - `max_lifetime=3600`: 每小时回收连接（防止连接泄漏）
 - `max_idle=600`: 10分钟空闲自动回收
 
@@ -1009,7 +1030,7 @@ class ReconnectionManager:
     重连管理器（指数退避策略）
 
     特性:
-    - 指数退避: 1s → 2s → 4s → 8s → 16s → 32s → 60s
+    - 指数退避: 1s → 2s → 4s → 8s → 10s (封顶)
     - 随机抖动: ±25% (防止雷鸣羊群效应)
     - 可配置最大延迟和重试次数
     """
@@ -1017,7 +1038,7 @@ class ReconnectionManager:
     def __init__(
         self,
         initial_delay=1.0,    # 初始延迟
-        max_delay=60.0,       # 最大延迟
+        max_delay=10.0,       # 最大延迟
         multiplier=2.0,       # 递增因子
         max_retries=None      # 最大重试次数
     ):
@@ -1046,9 +1067,7 @@ def get_delay(self) -> float:
 尝试2: 2.0s ± 25% = 1.5-2.5s
 尝试3: 4.0s ± 25% = 3.0-5.0s
 尝试4: 8.0s ± 25% = 6.0-10.0s
-尝试5: 16.0s ± 25% = 12.0-20.0s
-尝试6: 32.0s ± 25% = 24.0-40.0s
-尝试7+: 60.0s ± 25% = 45.0-75.0s (封顶)
+尝试5+: 10.0s ± 25% = 7.5-12.5s (封顶)
 ```
 
 **代码引用**: `enhanced_ws_manager.py:120-183`
@@ -1664,7 +1683,7 @@ if health_result['short_window_state'] != "HEALTHY":
 
 #### 线程清单
 
-**通用版线程配置** (22个线程):
+**通用版线程配置** (~37个线程):
 
 | 线程名称 | 数量 | 职责 | 启动方式 |
 |---------|------|------|---------|
@@ -1672,7 +1691,7 @@ if health_result['short_window_state'] != "HEALTHY":
 | Ping线程 | 1 | 每5秒发送ping保活 | `threading.Thread` |
 | 健康监控线程 | 1 | 每2秒检查连接健康 | `threading.Thread` |
 | batch_writer线程 | 1 | K线批量写入TimescaleDB | `threading.Thread` |
-| analysis_worker线程 | 15 | 并发执行分析任务 | `threading.Thread` × 15 |
+| analysis_worker线程 | 30 | 并发执行分析任务 | `threading.Thread` × 30 |
 | result_batch_writer线程 | 1 | 分析结果批量写入 | `threading.Thread` |
 | queue_monitor线程 | 1 | 队列使用率监控 | `threading.Thread` |
 | new_symbol_monitor线程 | 1 | 新币种监控 | `threading.Thread` |
@@ -1689,8 +1708,8 @@ if health_result['short_window_state'] != "HEALTHY":
 | new_symbol_monitor | 0 | ❌ 禁用（固定币种列表） |
 
 **线程数对比**:
-- 通用版: 22个线程 (3 WebSocket + 1 批量写入 + 15 分析worker + 1 结果写入 + 1 队列监控 + 1 币种监控)
-- HYPE版: 8个线程 (3 WebSocket + 1 批量写入 + 2 分析worker + 1 结果写入 + 1 队列监控)
+- 通用版: ~37个线程 (3 WebSocket + 1 批量写入 + 30 分析worker + 1 结果写入 + 1 队列监控 + 1 币种监控)
+- HYPE版: ~8个线程 (3 WebSocket + 1 批量写入 + 2 分析worker + 1 结果写入 + 1 队列监控)
 
 **差异原因**: HYPE版专注单一配对（HYPE/PURR），订阅数少，减少worker数量，取消币种监控
 
@@ -1786,8 +1805,8 @@ def stop_service(self):
 | 队列名称 | 大小 | 类型 | 写入者 | 读取者 | 批量触发条件 |
 |---------|------|------|-------|-------|-------------|
 | kline_buffer | 10000 | queue.Queue | on_message | batch_writer | 1000条 OR 5秒 |
-| analysis_queue | 15000 | queue.Queue | on_message (5m) | 15×analysis_worker | 实时消费 |
-| analysis_result_buffer | 10000 | queue.Queue | 15×analysis_worker | result_batch_writer | 100条 OR 2秒 |
+| analysis_queue | 30000 | queue.Queue | on_message (5m) | 30×analysis_worker | 实时消费 |
+| analysis_result_buffer | 10000 | queue.Queue | 30×analysis_worker | result_batch_writer | 100条 OR 2秒 |
 
 **代码引用**: `src/services/realtime_kline_service.py:208-220`
 
@@ -1797,7 +1816,7 @@ def stop_service(self):
 # 队列配置（从配置文件读取）
 QUEUE_CONFIG_GENERAL = {
     'kline_buffer_size': 10000,
-    'analysis_queue_size': 15000,
+    'analysis_queue_size': 30000,
     'analysis_result_buffer_size': 10000
 }
 
@@ -1809,7 +1828,7 @@ self.analysis_result_buffer = queue.Queue(maxsize=QUEUE_CONFIG_GENERAL['analysis
 
 **队列大小设计原则**:
 - kline_buffer: 10000条 ≈ 5分钟缓冲（N个币种 × 3周期）
-- analysis_queue: 15000条 ≈ 15分钟缓冲（考虑分析耗时）
+- analysis_queue: 30000条 ≈ 应对市场高波动期的分析缓冲
 - analysis_result_buffer: 10000条 ≈ 批量写入缓冲
 
 **代码引用**: `src/utils/core/config.py:QUEUE_CONFIG_GENERAL`, `src/services/realtime_kline_service.py:208-220`
@@ -1818,9 +1837,9 @@ self.analysis_result_buffer = queue.Queue(maxsize=QUEUE_CONFIG_GENERAL['analysis
 
 | 队列 | 通用版 | HYPE版 | 差异原因 |
 |------|-------|--------|---------|
-| kline_buffer | 10000 | 5000 | HYPE版订阅数少（1个币种 vs N个币种） |
-| analysis_queue | 15000 | 3000 | 分析worker少（2个 vs 15个） |
-| analysis_result_buffer | 10000 | 5000 | 结果产生速度低（2 workers） |
+| kline_buffer | 10000 | 1000 | HYPE版订阅数少（2个币种 vs N个币种） |
+| analysis_queue | 30000 | 1000 | 分析worker少（2个 vs 30个） |
+| analysis_result_buffer | 10000 | 1000 | 结果产生速度低（2 workers） |
 
 **配置来源**: `src/utils/core/config.py`
 - 通用版: `QUEUE_CONFIG_GENERAL`
@@ -1858,7 +1877,7 @@ self.recent_analysis_lock = threading.Lock()
 
 ```python
 ENQUEUE_DEDUP_WINDOWS = {
-    '5m': 30,    # 5m周期: 30秒去重窗口
+    '5m': 1,     # 5m周期: 1秒去重窗口
     '1h': 180,   # 1h周期: 180秒去重窗口
     '4h': 600,   # 4h周期: 600秒去重窗口
 }
@@ -1888,7 +1907,7 @@ def _enqueue_analysis_if_needed(self, symbol: str, timeframe: str, kline_time: d
 ```
 
 **去重窗口设计**:
-- 5m周期: 30秒 (约1/10周期)
+- 5m周期: 1秒 (极短窗口，允许高频触发)
 - 1h周期: 180秒 (约1/20周期)
 - 4h周期: 600秒 (约1/24周期)
 
@@ -1898,7 +1917,7 @@ def _enqueue_analysis_if_needed(self, symbol: str, timeframe: str, kline_time: d
 
 ```python
 DEDUP_WINDOWS = {
-    '5m': 60,    # 5m周期: 60秒去重窗口
+    '5m': 1,     # 5m周期: 1秒去重窗口
     '1h': 300,   # 1h周期: 300秒去重窗口
     '4h': 900,   # 4h周期: 900秒去重窗口
 }
@@ -1924,7 +1943,7 @@ def _analyze_and_alert(self, task: Dict):
 ```
 
 **去重窗口设计**:
-- 5m周期: 60秒 (约1/5周期)
+- 5m周期: 1秒 (极短窗口，允许高频触发)
 - 1h周期: 300秒 (约1/12周期)
 - 4h周期: 900秒 (约1/16周期)
 
@@ -2610,10 +2629,10 @@ def _reconnect_with_backoff(self):
 ```
 
 **重连策略**:
-- 指数退避: 1s → 2s → 4s → 8s → 16s → 32s → 60s
+- 指数退避: 1s → 2s → 4s → 8s → 10s (封顶)
 - 随机抖动: ±25%
-- 最大重试: 30次
-- 告警机制: 第5次失败发送告警
+- 最大重试: 无限次 (WS_MAX_RETRIES=None)
+- 告警机制: 可配置 (WS_ALERT_THRESHOLD)
 
 **代码引用**: `enhanced_ws_manager.py:1009-1076`
 
@@ -3518,7 +3537,7 @@ LARK_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your_webhook_id
 # 服务配置
 DEFAULT_BASE_SYMBOL=BTC/USDC:USDC
 DEFAULT_TIMEFRAMES=5m,1h,4h
-ANALYSIS_WORKERS_GENERAL=15
+ANALYSIS_WORKERS_GENERAL=30
 
 # 性能配置
 DEFAULT_BATCH_SIZE=1000
@@ -3555,7 +3574,7 @@ LARK_WEBHOOK_URL = os.getenv('LARK_WEBHOOK_URL')
 # 服务配置
 DEFAULT_BASE_SYMBOL = os.getenv('DEFAULT_BASE_SYMBOL', 'BTC/USDC:USDC')
 DEFAULT_TIMEFRAMES = os.getenv('DEFAULT_TIMEFRAMES', '5m,1h,4h').split(',')
-ANALYSIS_WORKERS_GENERAL = int(os.getenv('ANALYSIS_WORKERS_GENERAL', 15))
+ANALYSIS_WORKERS_GENERAL = int(os.getenv('ANALYSIS_WORKERS_GENERAL', 30))
 ```
 
 **代码引用**: `src/utils/core/config.py`
@@ -3585,16 +3604,16 @@ services:
 # 队列大小限制
 QUEUE_CONFIG_GENERAL = {
     'kline_buffer_size': 10000,
-    'analysis_queue_size': 15000,
+    'analysis_queue_size': 30000,
     'analysis_result_buffer_size': 10000
 }
 
 # 数据库连接池限制
-POOL_MIN_SIZE = 2
-POOL_MAX_SIZE = 10
+TIMESCALEDB_POOL_MIN_SIZE = 5
+TIMESCALEDB_POOL_MAX_SIZE = 60
 
 # 工作线程数限制
-ANALYSIS_WORKERS_GENERAL = 15
+ANALYSIS_WORKERS_GENERAL = 30
 
 # 查询结果限制
 DB_QUERY_LIMIT = 10000
@@ -3712,13 +3731,13 @@ MIN_4H_DATA_POINTS = 358  # 新币种4H数据点阈值
 
 ```python
 # 相关性阈值
-TARGET_CORR_THRESHOLD = 0.7      # 相关系数阈值（前置过滤）
+TARGET_CORR_THRESHOLD = 0.6      # 相关系数阈值（前置过滤）
 CORRELATION_METHOD = 'pearson'    # 相关系数方法
 
 # OLS协整参数
 BETA_WINDOW = 100                 # OLS回归窗口（期数）
 ZSCORE_WINDOW = 30                # Z-score计算窗口（期数）
-COINTEGRATION_THRESHOLD = 0.05    # ADF检验p值阈值
+COINTEGRATION_THRESHOLD = 2       # 最少需要2个协整检验通过
 
 # Z-score阈值（不同周期）
 ZSCORE_THRESHOLDS = {
@@ -3745,7 +3764,7 @@ ALPHA_SAME_ASSET_THRESHOLD = 2.0  # 同类资产阈值
 ```python
 QUEUE_CONFIG_GENERAL = {
     'kline_buffer_size': 10000,          # K线缓冲队列大小
-    'analysis_queue_size': 15000,        # 分析任务队列大小
+    'analysis_queue_size': 30000,        # 分析任务队列大小
     'analysis_result_buffer_size': 10000 # 分析结果队列大小
 }
 
@@ -3761,11 +3780,11 @@ QUEUE_GET_TIMEOUT = 1.0         # 队列获取超时（秒）
 
 ```python
 # 分析工作线程数
-ANALYSIS_WORKERS_GENERAL = 15
+ANALYSIS_WORKERS_GENERAL = 30
 
 # 线程关闭超时
-WORKER_THREAD_SHUTDOWN_TIMEOUT = 30    # 工作线程关闭超时（秒）
-MAIN_THREAD_SHUTDOWN_TIMEOUT = 60      # 主线程关闭超时（秒）
+WORKER_THREAD_SHUTDOWN_TIMEOUT = 5.0    # 工作线程关闭超时（秒）
+MAIN_THREAD_SHUTDOWN_TIMEOUT = 10.0     # 主线程关闭超时（秒）
 ```
 
 **代码引用**: `src/utils/core/config.py:ANALYSIS_WORKERS_GENERAL`
@@ -3775,14 +3794,14 @@ MAIN_THREAD_SHUTDOWN_TIMEOUT = 60      # 主线程关闭超时（秒）
 ```python
 # 入队去重窗口（秒）
 ENQUEUE_DEDUP_WINDOWS = {
-    '5m': 30,    # 5m周期: 30秒
+    '5m': 1,     # 5m周期: 1秒
     '1h': 180,   # 1h周期: 180秒
     '4h': 600    # 4h周期: 600秒
 }
 
 # 分析去重窗口（秒）
 DEDUP_WINDOWS = {
-    '5m': 60,    # 5m周期: 60秒
+    '5m': 1,     # 5m周期: 1秒
     '1h': 300,   # 1h周期: 300秒
     '4h': 900    # 4h周期: 900秒
 }
@@ -3820,17 +3839,17 @@ REVERSION_DOUBLE_CHECK_WINDOW_SECONDS = 300  # 时间窗口（秒）
 
 ```python
 # 连接池配置
-POOL_MIN_SIZE = 2            # 最小连接数
-POOL_MAX_SIZE = 10           # 最大连接数
-POOL_TIMEOUT = 30            # 获取连接超时（秒）
-POOL_MAX_LIFETIME = 3600     # 连接最大存活时间（秒）
-POOL_MAX_IDLE = 600          # 最大空闲时间（秒）
+TIMESCALEDB_POOL_MIN_SIZE = 5     # 最小连接数
+TIMESCALEDB_POOL_MAX_SIZE = 60    # 最大连接数（匹配30工作线程×2）
+TIMESCALEDB_POOL_TIMEOUT = 30.0   # 获取连接超时（秒）
+TIMESCALEDB_POOL_MAX_LIFETIME = 3600  # 连接最大存活时间（秒）
+TIMESCALEDB_POOL_MAX_IDLE = 600   # 最大空闲时间（秒）
 
 # 查询限制
 DB_QUERY_LIMIT = 10000       # 单次查询最大返回条数
 ```
 
-**代码引用**: `src/utils/core/config.py:POOL_MIN_SIZE`, `src/utils/core/config.py:DB_QUERY_LIMIT`
+**代码引用**: `src/utils/core/config.py:TIMESCALEDB_POOL_MIN_SIZE`, `src/utils/core/config.py:DB_QUERY_LIMIT`
 
 ### 11.3 ServiceConfig 数据类配置
 
@@ -3838,64 +3857,64 @@ DB_QUERY_LIMIT = 10000       # 单次查询最大返回条数
 
 **目的**: 通过数据类参数化通用版和HYPE版的配置差异，实现 Template Method Pattern
 
-**数据结构** (`src/services/realtime_kline_service_base.py:80-89`):
+**数据结构** (`src/services/realtime_kline_service_base.py:85-93`):
 ```python
 from dataclasses import dataclass
-from typing import Type
+from typing import Type, Dict
 
 @dataclass
 class ServiceConfig:
-    """服务配置数据类
+    """服务配置参数数据类
 
     用于参数化通用版和HYPE版的配置差异，支持 Template Method Pattern
     """
     base_symbol: str                    # 基准币种 (如 "BTC/USDC:USDC" 或 "HYPE/USDC:USDC")
-    correlation_threshold: float        # 相关系数阈值 (0.85 或 0.99)
-    analysis_workers: int               # 分析线程数 (15 或 2)
-    queue_config: dict                  # 队列大小配置
-    enable_new_symbol_monitor: bool     # 是否启用新币种监控
-    data_filler_class: Type             # 数据填充器类型 (KlineDataFiller 或 KlineDataFillerLazy)
+    corr_threshold: float              # 相关系数阈值 (0.6 或 0.5)
+    queue_config: Dict[str, int]       # 队列配置
+    analysis_workers: int              # 工作线程数 (30 或 2)
+    data_filler_class: Type            # 数据填充器类 (KlineDataFiller 或 KlineDataFillerLazy)
+    logger_module: str                 # logger 模块标识（'logger' 或 'get_logger'）
 ```
 
 #### 配置实例对比
 
-**通用版配置** (`src/services/realtime_kline_service.py`):
+**通用版配置** (`src/services/realtime_kline_service.py:89-103`):
 ```python
 from src.utils.core.config import (
     DEFAULT_BASE_SYMBOL,            # "BTC/USDC:USDC"
-    TARGET_CORR_THRESHOLD,          # 0.85
-    ANALYSIS_WORKERS_GENERAL,       # 15
-    QUEUE_CONFIG_GENERAL            # {kline:10000, analysis:15000, result:10000}
+    TARGET_CORR_THRESHOLD,          # 0.6
+    ANALYSIS_WORKERS_GENERAL,       # 30
+    QUEUE_CONFIG_GENERAL            # {kline:10000, analysis:30000, result:10000}
 )
 from src.utils.analysis.kline_data_filler import KlineDataFiller
 
 config = ServiceConfig(
     base_symbol=DEFAULT_BASE_SYMBOL,
-    correlation_threshold=TARGET_CORR_THRESHOLD,
-    analysis_workers=ANALYSIS_WORKERS_GENERAL,
+    corr_threshold=TARGET_CORR_THRESHOLD,
     queue_config=QUEUE_CONFIG_GENERAL,
-    enable_new_symbol_monitor=True,
-    data_filler_class=KlineDataFiller
+    analysis_workers=ANALYSIS_WORKERS_GENERAL,
+    data_filler_class=KlineDataFiller,
+    logger_module='logger'
 )
 ```
 
-**HYPE版配置** (`src/services/realtime_kline_service_hype.py`):
+**HYPE版配置** (`src/services/realtime_kline_service_hype.py:78-92`):
 ```python
 from src.utils.core.config import (
     HYPE_BASE_SYMBOL,              # "HYPE/USDC:USDC"
-    HYPE_CORR_THRESHOLD,           # 0.99
+    HYPE_CORR_THRESHOLD,           # 0.5
     ANALYSIS_WORKERS_HYPE,         # 2
-    QUEUE_CONFIG_HYPE              # {kline:5000, analysis:3000, result:5000}
+    QUEUE_CONFIG_HYPE              # {kline:1000, analysis:1000, result:1000}
 )
 from src.utils.analysis.kline_data_filler import KlineDataFillerLazy
 
 config = ServiceConfig(
     base_symbol=HYPE_BASE_SYMBOL,
-    correlation_threshold=HYPE_CORR_THRESHOLD,
-    analysis_workers=ANALYSIS_WORKERS_HYPE,
+    corr_threshold=HYPE_CORR_THRESHOLD,
     queue_config=QUEUE_CONFIG_HYPE,
-    enable_new_symbol_monitor=False,
-    data_filler_class=KlineDataFillerLazy
+    analysis_workers=ANALYSIS_WORKERS_HYPE,
+    data_filler_class=KlineDataFillerLazy,
+    logger_module='logger'
 )
 ```
 
@@ -3904,51 +3923,51 @@ config = ServiceConfig(
 | 配置字段 | 通用版 | HYPE版 | 差异原因 |
 |---------|--------|--------|---------|
 | base_symbol | BTC/USDC:USDC | HYPE/USDC:USDC | HYPE版专注单一基准 |
-| correlation_threshold | 0.85 | 0.99 | HYPE版要求更高相关性 |
-| analysis_workers | 15 | 2 | HYPE版订阅数少，减少线程 |
-| queue_config.kline_buffer | 10000 | 5000 | HYPE版订阅数少 |
-| queue_config.analysis_queue | 15000 | 3000 | 分析任务少 |
-| queue_config.result_buffer | 10000 | 5000 | 结果产生速度低 |
-| enable_new_symbol_monitor | True | False | HYPE版固定币种列表 |
+| corr_threshold | 0.6 | 0.5 | HYPE版使用更宽松阈值 |
+| analysis_workers | 30 | 2 | HYPE版订阅数少，减少线程 |
+| queue_config.kline_buffer | 10000 | 1000 | HYPE版订阅数少 |
+| queue_config.analysis_queue | 30000 | 1000 | 分析任务少 |
+| queue_config.result_buffer | 10000 | 1000 | 结果产生速度低 |
 | data_filler_class | KlineDataFiller | KlineDataFillerLazy | HYPE版使用懒加载 |
+| logger_module | 'logger' | 'logger' | 日志模块标识 |
 
 #### 配置加载流程
 
 ```python
 class RealtimeKlineServiceBase(ABC):
-    """抽象基类"""
+    """抽象基类（模板方法模式）"""
 
-    def __init__(self, config: ServiceConfig):
-        """初始化服务
+    def __init__(self, base_symbol=None, timeframes=None, ...):
+        """初始化服务（模板方法）
 
-        Args:
-            config: ServiceConfig实例，包含所有配置参数
+        通过子类实现 _get_config_params() 获取 ServiceConfig
         """
-        self.config = config
-        self.base_symbol = config.base_symbol
-        self.correlation_threshold = config.correlation_threshold
+        # 1. 获取子类配置
+        self._config = self._get_config_params()
 
-        # 初始化队列
-        self.kline_buffer = queue.Queue(
-            maxsize=config.queue_config['kline_buffer_size']
-        )
-        self.analysis_queue = queue.Queue(
-            maxsize=config.queue_config['analysis_queue_size']
-        )
+        # 2. 初始化基础配置
+        self.base_symbol = base_symbol or self._config.base_symbol
 
-        # 启动分析worker线程
-        for i in range(config.analysis_workers):
+        # 3. 动态初始化 logger
+        self.logger = self._init_logger(self._config.logger_module)
+
+        # 4. 初始化数据填充器（使用配置指定的类）
+        self.data_filler = self._config.data_filler_class(kline_repo=self.kline_repo)
+
+        # 5. 初始化队列（使用配置参数）
+        queue_config = self._config.queue_config
+        self.kline_buffer = queue.Queue(maxsize=queue_config['kline_buffer_size'])
+        self.analysis_queue = queue.Queue(maxsize=queue_config['analysis_queue_size'])
+        self.analysis_result_buffer = queue.Queue(maxsize=queue_config['analysis_result_buffer_size'])
+
+        # 6. 启动分析worker线程
+        for i in range(self._config.analysis_workers):
             t = threading.Thread(target=self._analysis_worker)
             t.start()
 
-        # 根据配置决定是否启动新币种监控
-        if config.enable_new_symbol_monitor:
+        # 7. 根据子类实现决定是否启动新币种监控
+        if self._should_enable_symbol_monitoring():
             self._start_new_symbol_monitor()
-
-        # 使用配置的数据填充器类
-        self.data_filler = config.data_filler_class(
-            base_symbol=self.base_symbol
-        )
 ```
 
 #### 设计优势
@@ -3974,19 +3993,19 @@ class RealtimeKlineServiceBase(ABC):
 - ✅ 配置参数化测试支持
 
 **代码引用**:
-- ServiceConfig定义: `src/services/realtime_kline_service_base.py:80-89`
-- 通用版配置: `src/services/realtime_kline_service.py:20-35`
-- HYPE版配置: `src/services/realtime_kline_service_hype.py:20-35`
-- 配置使用: `src/services/realtime_kline_service_base.py:92-150`
+- ServiceConfig定义: `src/services/realtime_kline_service_base.py:85-93`
+- 通用版配置: `src/services/realtime_kline_service.py:89-103`
+- HYPE版配置: `src/services/realtime_kline_service_hype.py:78-92`
+- 配置使用: `src/services/realtime_kline_service_base.py:125-196`
 
 ### 11.4 WebSocket配置
 
 ```python
 # 连接配置
 WS_URL = 'wss://api.hyperliquid.xyz/ws'
-WS_TIMEOUT = 30              # 连接超时（秒）
-WS_MAX_RETRIES = 30          # 最大重试次数
-WS_ALERT_THRESHOLD = 5       # 告警阈值（第N次失败）
+WS_TIMEOUT = 60              # 连接超时（秒）
+WS_MAX_RETRIES = None        # 最大重试次数（None=无限重试）
+WS_ALERT_THRESHOLD = None    # 告警阈值（None=不发送告警）
 
 # Ping配置
 WS_PING_INTERVAL_MS = 5000   # Ping间隔（毫秒）
@@ -3994,30 +4013,156 @@ WS_PING_THREAD_SHUTDOWN_TIMEOUT = 2.0  # Ping线程关闭超时（秒）
 
 # 健康监控配置
 WS_HEALTH_MONITOR_TIMEOUT = 15          # 假活检测超时（秒）
-WS_HEALTH_MONITOR_WARNING_THRESHOLD = 10 # 警告阈值（秒）
+WS_HEALTH_MONITOR_WARNING_THRESHOLD = 15 # 警告阈值（秒）
 WS_HEALTH_CHECK_INTERVAL = 2            # 健康检查间隔（秒）
 WS_HEALTH_REPORT_INTERVAL = 60          # 健康报告间隔（秒）
 
 # 重连配置
-WS_RECONNECT_MIN_DELAY = 1.0            # 最小重连延迟（秒）
+WS_RECONNECT_MIN_DELAY = 0.1            # 最小重连延迟（秒）
 WS_RECONNECT_INITIAL_DELAY = 1.0        # 初始重连延迟（秒）
-WS_RECONNECT_MAX_DELAY = 60.0           # 最大重连延迟（秒）
+WS_RECONNECT_MAX_DELAY = 10.0           # 最大重连延迟（秒）
 WS_RECONNECT_MULTIPLIER = 2.0           # 延迟递增因子
 WS_RECONNECT_JITTER = 0.25              # 随机抖动比例（±25%）
 
 # 状态管理
-WS_STATE_VALIDATION_DELAY = 0.1         # 状态验证延迟（秒）
-WS_READY_TIMEOUT = 30                   # 就绪超时（秒）
-WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
+WS_STATE_VALIDATION_DELAY = 1.0         # 状态验证延迟（秒）
+WS_READY_TIMEOUT = 5.0                  # 就绪超时（秒）
+WS_CLEANUP_DELAY = 0.5                  # 清理延迟（秒）
+
+# 批量订阅配置
+WS_SUBSCRIBE_BATCH_SIZE = 50            # 批量订阅大小
+WS_SUBSCRIBE_BATCH_DELAY = 0.1          # 批量订阅间隔（秒）
 ```
 
 **代码引用**: `src/utils/core/config.py:WS_URL`, `src/utils/core/config.py:WS_PING_INTERVAL_MS`
 
 ---
 
-## 12. 附录
+## 12. 建仓双重确认与平仓机制
 
-### 12.1 关键设计决策
+### 12.1 建仓双重确认 (DoubleCheckState)
+
+#### 设计动机
+
+传统策略中，单次异常信号可能是噪声。双重确认机制要求：
+1. **首次信号**: 记录状态（方向、Z-score、时间戳）
+2. **确认信号**: 在时间窗口内再次检测到信号增强才触发告警
+
+**核心数据结构** (`src/services/realtime_kline_service_base.py:106-111`):
+```python
+@dataclass
+class DoubleCheckState:
+    """建仓告警双重确认状态"""
+    zscore_5m: float                     # 触发时的 5m Z-score
+    direction: str                       # 'long' 或 'short'
+    first_signal_time: datetime = None   # 第一次信号时间 (UTC)
+```
+
+#### 确认流程
+
+```
+首次信号 → 记录 DoubleCheckState
+  ↓
+等待窗口内 (300秒)
+  ↓
+第二次信号:
+  - |zscore_5m| 增大 (信号增强)
+  - |zscore_5m| > 2.5 (超强阈值)
+  → ✅ 确认通过，发送建仓告警
+
+超出窗口 → ❌ 过期重置
+
+方向变化 → 🔄 替换为新方向的首次信号
+```
+
+#### 配置参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| DOUBLE_CHECK_WINDOW_SECONDS | 300 | 双重确认时间窗口（5分钟） |
+| DOUBLE_CHECK_ZSCORE_5M_THRESHOLD | 2.5 | 5m Z-score绝对值增强阈值 |
+| DOUBLE_CHECK_CLEANUP_SECONDS | 600 | 过期状态清理阈值（10分钟） |
+
+**代码引用**: `src/services/realtime_kline_service_base.py:1257-1332`
+
+### 12.2 均值回归平仓 (MeanReversionState)
+
+#### 设计动机
+
+建仓后，需要监控 zscore_4h 是否回归到建仓时的 baseline 水平，确认价差恢复后发送平仓告警。
+
+**核心数据结构** (`src/services/realtime_kline_service_base.py:96-103`):
+```python
+@dataclass
+class MeanReversionState:
+    """均值回归事件循环状态"""
+    baseline: float              # 建仓时的 avg_zscore_4h
+    direction: str               # 'long' 或 'short'
+    signal_time: datetime = None  # 建仓时间
+    first_reversion_time: datetime = None   # 首次回归检测时间
+    first_reversion_value: float = None     # 首次回归时的 zscore_4h
+```
+
+#### 平仓检测流程
+
+```
+建仓告警发送后 → 缓存 MeanReversionState (baseline = avg_zscore_4h)
+  ↓
+每次分析执行 → 检查 zscore_4h 是否回归至 baseline
+  ↓
+首次检测到回归 → 记录 first_reversion_time
+  ↓
+窗口内再次检测 (300秒):
+  - 回归仍成立 → ✅ 平仓双重确认通过，发送平仓告警
+  - 回归消失   → ❌ 重置 first_reversion_time
+  - 超出窗口   → ⏳ 视为新的首次检测
+```
+
+#### 回归判定规则
+
+- **long方向**: zscore_4h 从负值回升到 baseline 水平
+- **short方向**: zscore_4h 从正值回落到 baseline 水平
+- **回归消失**: 再次检测时 zscore_4h 偏离 baseline
+
+#### 配置参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| REVERSION_DOUBLE_CHECK_WINDOW_SECONDS | 300 | 平仓双重确认时间窗口（5分钟） |
+
+#### 状态清理
+
+`queue_monitor` 线程定期清理过期的 DoubleCheckState 和 MeanReversionState：
+- 建仓状态超过 DOUBLE_CHECK_CLEANUP_SECONDS (600秒) 自动清理
+- 平仓状态随告警发送后自动清除
+
+**代码引用**: `src/services/realtime_kline_service_base.py:1393-1490`
+
+### 12.3 统计监控
+
+双重确认机制的运行状态通过 stats 字典实时追踪：
+
+```python
+# 建仓双重确认统计
+'double_check_first_signals': 0,    # 首次信号
+'double_check_confirmed': 0,        # 确认通过
+'double_check_refreshed': 0,        # 信号刷新（方向变化）
+'double_check_expired': 0,          # 超时重置
+
+# 平仓双重确认统计
+'reversion_dc_first_signals': 0,    # 首次检测
+'reversion_dc_confirmed': 0,        # 确认通过
+'reversion_dc_expired': 0,          # 超时重置
+'reversion_dc_reset': 0,            # 回归消失重置
+```
+
+**代码引用**: `src/services/realtime_kline_service_base.py:259-280`
+
+---
+
+## 13. 附录
+
+### 13.1 关键设计决策
 
 #### 1. 直接订阅原生K线 vs 本地聚合
 
@@ -4078,11 +4223,11 @@ WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
 
 **权衡**:
 - ❌ 线程上下文切换开销
-- ✅ 15线程规模可接受，避免asyncio生态碎片化
+- ✅ 37线程规模可接受，避免asyncio生态碎片化
 
 **代码引用**: `src/services/realtime_kline_service.py:224-275`
 
-### 12.2 技术权衡分析
+### 13.2 技术权衡分析
 
 #### 性能 vs 可靠性
 
@@ -4106,7 +4251,7 @@ WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
 
 **设计原则**: 核心算法优先精度，辅助功能优先简单
 
-### 12.3 未来优化方向
+### 13.3 未来优化方向
 
 #### 短期优化 (1-3个月)
 
@@ -4163,7 +4308,7 @@ WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
    - 策略配置管理
    - 历史数据查询
 
-### 12.4 项目文件结构（v1.1）
+### 13.4 项目文件结构（v1.2）
 
 #### 完整目录树
 
@@ -4171,32 +4316,35 @@ WS_CLEANUP_DELAY = 2.0                  # 清理延迟（秒）
 
 ```
 hyperliquid-pair-hype-purr-analyze/
-├── src/                                    # 源代码目录（v1.1新增）
+├── src/                                    # 源代码目录
 │   ├── services/                           # 服务层
-│   │   ├── realtime_kline_service_base.py  # 抽象基类（1599行）
-│   │   ├── realtime_kline_service.py       # 通用版实现（182行）
-│   │   └── realtime_kline_service_hype.py  # HYPE版实现（146行）
+│   │   ├── realtime_kline_service_base.py  # 抽象基类（1931行）
+│   │   ├── realtime_kline_service.py       # 通用版实现（183行）
+│   │   └── realtime_kline_service_hype.py  # HYPE版实现（137行）
 │   └── utils/                              # 工具模块
 │       ├── analysis/                       # 分析工具
-│       │   ├── analysis_core.py            # 核心分析算法（1022行）
-│       │   ├── kline_aggregator.py         # K线聚合器
+│       │   ├── analysis_core.py            # 核心分析算法（976行）
 │       │   ├── kline_data_filler.py        # 数据填充器
-│       │   ├── scheduler.py                # 调度器
 │       │   └── coingetation_more_check.py  # 协整健康监控
 │       ├── database/                       # 数据库工具
-│       │   ├── timescaledb.py              # TimescaleDB连接池（1075行）
-│       │   └── redisdb.py                  # Redis缓存
+│       │   └── timescaledb.py              # TimescaleDB连接池
 │       ├── websocket/                      # WebSocket工具
-│       │   └── enhanced_ws_manager.py      # 增强WebSocket管理器（1214行）
+│       │   └── enhanced_ws_manager.py      # 增强WebSocket管理器
 │       ├── monitoring/                     # 监控工具
 │       │   ├── lark_bot.py                 # 飞书机器人
-│       │   ├── alert_formatter.py          # 告警格式化
-│       │   └── spider_failed_alert.py      # 爬虫失败告警
+│       │   └── alert_formatter.py          # 告警格式化
 │       └── core/                           # 核心工具
-│           ├── config.py                   # 配置管理（150行）
+│           ├── config.py                   # 配置管理（158行）
 │           └── logging_config.py           # 日志配置
+├── backtest/                               # 回测脚本
+│   ├── backtest_with_double_check.py       # 双重确认策略回测
+│   └── backtest_entry.py                   # 建仓策略回测
+├── query/                                  # 数据查询脚本
+│   ├── query_analysis_results.py           # 分析结果查询
+│   └── query_klines.py                     # K线数据查询
 ├── docs/                                   # 文档目录
-│   ├── DESIGN.md                           # 技术设计文档（v1.1，本文档）
+│   ├── DESIGN.md                           # 技术设计文档（v1.2，本文档）
+│   ├── README.md                           # 项目说明文档
 │   ├── Johansen检验详解.md                  # Johansen协整检验
 │   └── Old方法和New方法差异解释.md          # 协整方法对比
 ├── spider/                                 # 爬虫脚本
@@ -4206,7 +4354,7 @@ hyperliquid-pair-hype-purr-analyze/
 ├── docker-compose.yml                      # Docker编排配置
 ├── pyproject.toml                          # Python项目配置（uv管理）
 ├── uv.lock                                 # 依赖锁定文件
-└── README.md                               # 项目说明
+└── README.md                               # 项目说明（根目录）
 ```
 
 #### 重构变更摘要（提交 `fee7e19`）
@@ -4260,8 +4408,8 @@ from src.utils.database.timescaledb import TimescaleDBManager
 - ✅ 模块职责明确，降低耦合
 
 **2. 架构模式引入**:
-- ✅ Template Method Pattern（1599行基类 + 2个实现）
-- ✅ 消除代码重复（1440+行）
+- ✅ Template Method Pattern（1931行基类 + 2个实现）
+- ✅ 消除代码重复（1700+行）
 - ✅ 支持多场景部署（通用版、HYPE版）
 
 **3. 可维护性提升**:
