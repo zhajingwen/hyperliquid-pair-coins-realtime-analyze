@@ -18,7 +18,7 @@ Date: 2026-01-19
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Tuple, Optional
-from statsmodels.tsa.stattools import coint, adfuller
+from statsmodels.tsa.stattools import adfuller
 import statsmodels.api as sm
 
 from src.utils.core.logging_config import logger
@@ -30,7 +30,6 @@ from src.utils.core.config import (
     BETA_WINDOW,
     ZSCORE_WINDOW,
     COINTEGRATION_THRESHOLD,
-    TARGET_CORR_THRESHOLD,
     ALPHA_SIGNIFICANCE_LEVEL,
     ALPHA_CROSS_ASSET_THRESHOLD,
     ALPHA_SAME_ASSET_THRESHOLD,

@@ -1,6 +1,5 @@
 import os
 from typing import Dict, List, Tuple, Optional
-from src.utils.core.logging_config import logger
 
 # ============ 敏感信息（保留环境变量） ============
 lark_bot_id: Optional[str] = os.getenv('LARKBOT_ID')

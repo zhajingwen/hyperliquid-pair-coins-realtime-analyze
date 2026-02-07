@@ -11,9 +11,8 @@
 7. 交易建议
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, Optional, List, Tuple
-from src.utils.core.logging_config import logger
 from src.utils.core.config import (
     ZSCORE_THRESHOLDS,
     HEALTH_MONITOR_LONG_WINDOW,

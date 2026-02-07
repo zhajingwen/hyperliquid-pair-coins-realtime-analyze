@@ -594,12 +594,10 @@ class RealtimeKlineServiceBase(ABC):
 
         while not self.stop_event.is_set():
             try:
-                kline_fetched = False
                 try:
                     kline = self.kline_buffer.get(timeout=QUEUE_GET_TIMEOUT)
                     batch.append(kline)
                     items_to_mark_done += 1
-                    kline_fetched = True
                 except queue.Empty:
                     pass
 
@@ -698,12 +696,10 @@ class RealtimeKlineServiceBase(ABC):
 
         while not self.stop_event.is_set():
             try:
-                result_fetched = False
                 try:
                     analysis_record = self.analysis_result_buffer.get(timeout=QUEUE_GET_TIMEOUT)
                     batch.append(analysis_record)
                     items_to_mark_done += 1
-                    result_fetched = True
                 except queue.Empty:
                     pass
 

@@ -20,7 +20,6 @@ import socket
 import websocket
 from enum import Enum
 from typing import Dict, List, Optional, Callable
-from datetime import datetime, timezone
 
 from src.utils.core.logging_config import logger
 from src.utils.core.config import (
